@@ -1,0 +1,20 @@
+intraslot
+Copyright 2026 Misha Nasledov <misha@nasledov.com>
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This work derives from twemredis-py (https://github.com/mishan/twemredis-py),
+Copyright 2016 Misha Nasledov, also licensed under the Apache License,
+Version 2.0. No source code is carried over; the two share a technique, not an
+implementation.
+
+The canonical-key technique generalized here was first implemented in
+twemredis-py, which reproduced twemproxy's md5 key distribution inside the
+client so applications could address sharded Redis instances directly, without
+routing requests through a twemproxy process. Because a twemproxy shard was a
+whole Redis instance, computing one canonical key per shard was enough to make
+keys co-resident and intersectable.
+
+Redis Cluster requires multi-key commands to share a hash slot rather than a
+node, so intraslot pins one canonical key per slot instead of per shard, which
+makes the guarantee hold under resharding as well.

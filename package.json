@@ -1,0 +1,52 @@
+{
+  "name": "intraslot",
+  "version": "0.1.0",
+  "description": "Server-side set intersection for Redis Cluster: replicate a set to every hash slot so it stays co-slotted with any sharded key",
+  "main": "src/index.js",
+  "types": "types/index.d.ts",
+  "files": [
+    "src",
+    "data",
+    "types",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mishan/intraslot.git"
+  },
+  "homepage": "https://github.com/mishan/intraslot#readme",
+  "bugs": {
+    "url": "https://github.com/mishan/intraslot/issues"
+  },
+  "scripts": {
+    "test": "node --test test/slot.test.js",
+    "test:cluster": "bash scripts/with-cluster.sh node --test test/cluster.test.js",
+    "bench": "bash scripts/with-cluster.sh node test/bench.js",
+    "gen-table": "node scripts/gen-slot-table.js",
+    "types": "tsc -p jsconfig.json"
+  },
+  "keywords": [
+    "redis",
+    "redis-cluster",
+    "valkey",
+    "ioredis",
+    "sharding",
+    "hash-tag",
+    "sinter",
+    "crossslot"
+  ],
+  "author": "Misha Nasledov <misha@nasledov.com>",
+  "license": "Apache-2.0",
+  "peerDependencies": {
+    "ioredis": ">=5"
+  },
+  "devDependencies": {
+    "ioredis": "^5.4.1",
+    "cluster-key-slot": "^1.1.2"
+  }
+}
