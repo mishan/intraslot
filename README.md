@@ -250,14 +250,20 @@ Redis treats `{}` as *no tag* and hashes the whole key, stopping the search.
 Checked against a live server's `CLUSTER KEYSLOT` over 8016 keys:
 `cluster-key-slot@1.1.2` disagreed with Redis 460 times; this package, 0.
 
-Since ioredis routes with `cluster-key-slot`, keys of that shape get routed to
-the wrong node (recovered via `MOVED`) and, more seriously, `generateMulti()`
-misjudges multi-key commands in both directions — allowing ones the server will
-reject and refusing ones it would have accepted. A patch and repro are in
-[`contrib/cluster-key-slot/`](contrib/cluster-key-slot/).
+Both major Node clients depend on it — ioredis pins `1.1.1` exactly, node-redis's
+`@redis/client` uses `1.1.2` — and the two files are byte-identical, so the bug
+is live in both. In ioredis it also reaches `generateMulti()`, which gates every
+command in a pipeline and misjudges in both directions: allowing commands the
+server then rejects with `CROSSSLOT`, and refusing ones it would have accepted.
 
-This does not affect `intraslot`: the shipped tags are plain integers with no
-braces, where both implementations agree. It only matters if *your* keys contain
+It can't be fixed upstream — [invertase/cluster-key-slot](https://github.com/invertase/cluster-key-slot)
+was archived read-only on Mar 17, 2026, and ioredis's exact pin means an upstream
+release wouldn't reach anyone anyway. A full write-up, per-client call sites, a
+patch and reproducible validation are in
+[`contrib/empty-hashtag-slot-bug/`](contrib/empty-hashtag-slot-bug/).
+
+None of this affects `intraslot`: the shipped tags are plain integers with no
+braces, where every implementation agrees. It only matters if *your* keys contain
 `{}`, which is worth avoiding regardless — it usually means an empty template
 variable leaked into a key name.
 
