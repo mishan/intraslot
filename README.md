@@ -256,10 +256,14 @@ is live in both. In ioredis it also reaches `generateMulti()`, which gates every
 command in a pipeline and misjudges in both directions: allowing commands the
 server then rejects with `CROSSSLOT`, and refusing ones it would have accepted.
 
-It can't be fixed upstream — [invertase/cluster-key-slot](https://github.com/invertase/cluster-key-slot)
+It couldn't be fixed upstream — [invertase/cluster-key-slot](https://github.com/invertase/cluster-key-slot)
 was archived read-only on Mar 17, 2026, and ioredis's exact pin means an upstream
-release wouldn't reach anyone anyway. A full write-up, per-client call sites, a
-patch and reproducible validation are in
+release wouldn't reach anyone anyway — so it was fixed in the clients instead:
+both now vendor the slot function with the patch applied
+(ioredis [#2172](https://github.com/redis/ioredis/pull/2172), node-redis
+[#3431](https://github.com/redis/node-redis/pull/3431), merged on `main` and
+ahead of a release as of this writing). A full write-up, per-client call sites,
+the patch and reproducible validation are in
 [`contrib/empty-hashtag-slot-bug/`](contrib/empty-hashtag-slot-bug/).
 
 None of this affects `intraslot`: the shipped tags are plain integers with no

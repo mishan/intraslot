@@ -3,8 +3,13 @@
 **Affects:** `ioredis` (through 6.0.0) and `node-redis` / `@redis/client`
 (through 6.2.1), via their shared `cluster-key-slot` dependency.
 
-**Status:** cannot be fixed upstream — see [Why this has to land in the
-clients](#why-this-has-to-land-in-the-clients).
+**Status:** fixed in both clients, on `main` ahead of a release — ioredis
+[#2172](https://github.com/redis/ioredis/pull/2172) (merged 2026-09-01) and
+node-redis [#3431](https://github.com/redis/node-redis/pull/3431) (merged
+2026-08-31). Each vendors the slot function with the patch below and drops the
+`cluster-key-slot` dependency, since it could not be fixed upstream — see [Why
+this had to land in the clients](#why-this-had-to-land-in-the-clients). Releases
+up to the versions above still carry the bug.
 
 Written up here because [intraslot](https://github.com/mishan/intraslot) had to
 implement slot math itself to work around it. Everything below was measured
@@ -127,7 +132,7 @@ Single-key misrouting is recoverable through `MOVED`, so the practical impact fo
 node-redis is latency rather than wrong results — except for sharded pub/sub,
 where subscribing on the wrong master means messages are simply never received.
 
-## Why this has to land in the clients
+## Why this had to land in the clients
 
 The upstream repo,
 [invertase/cluster-key-slot](https://github.com/invertase/cluster-key-slot), was
@@ -142,6 +147,10 @@ users without a change in ioredis regardless.
 
 The function is roughly 40 lines plus a 256-entry lookup table, with no
 dependencies, which puts it well inside vendoring range for either client.
+That is what both did: ioredis now carries it as `lib/utils/calculateSlot.ts`
+and `@redis/client` as `lib/utils/calculate-slot.ts`, each with the patch
+applied, unit tests for the empty-tag cases, and parity tests against
+upstream's own suite.
 
 ## The patch
 
