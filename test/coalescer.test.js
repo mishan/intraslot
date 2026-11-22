@@ -86,3 +86,30 @@ test('a failed flush is retried a tick after it fails', async () => {
     await c.close();
   }
 });
+
+test('ticks keep coming while slots are behind, with no new change', async () => {
+  const fanout = {
+    behind: 0,
+    catchUps: 0,
+    async applyDelta() {
+      this.behind = 3;
+      return { ms: 1, failed: 3, failedSlots: [1, 2, 3], behind: 3 };
+    },
+    async catchUp() {
+      this.catchUps++;
+      this.behind = 0;
+      return { behind: 0 };
+    },
+  };
+  const c = new Coalescer(fanout, { tickMs: 20 });
+  const failed = [];
+  c.on('flush', (stats) => failed.push(stats.failed));
+  try {
+    c.add('x');
+    await sleep(150);
+    assert.strictEqual(fanout.catchUps, 1);
+    assert.deepStrictEqual(failed, [3, 0]);
+  } finally {
+    await c.close();
+  }
+});

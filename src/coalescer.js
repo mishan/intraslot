@@ -30,6 +30,10 @@ const { performance } = require('perf_hooks');
  * Flushes never overlap: changes queued while one runs wait for it to finish,
  * since two overlapping deltas can land out of order.
  *
+ * Slots a flush fails on stay behind in the IntraSlot, which brings them up to
+ * date in order with every later write. While any are behind, ticks keep
+ * coming, so they catch up without waiting for another change.
+ *
  * @example
  * const c = fan.coalescer({ tickMs: 250 });
  * c.on('flush', (s) => metrics.timing('fanout.tick', s.ms));
@@ -100,12 +104,17 @@ class Coalescer extends EventEmitter {
     else this._schedule();
   }
 
+  /** @private @returns {boolean} whether a flush has anything to send */
+  _hasWork() {
+    return this.pending > 0 || this.fanout.behind > 0;
+  }
+
   /**
    * Arm the timer for the next flush, a tick after the last one started.
    * @private
    */
   _schedule() {
-    if (this._timer || this._closed || this.pending === 0) return;
+    if (this._timer || this._closed || !this._hasWork()) return;
     const wait = Math.max(0, this._lastStart + this.tickMs - performance.now());
     this._timer = setTimeout(() => {
       this._timer = null;
@@ -116,13 +125,13 @@ class Coalescer extends EventEmitter {
 
   /** @private */
   _maybeFlush() {
-    if (this._flushing || this.pending === 0) return;
+    if (this._flushing || !this._hasWork()) return;
     this.flush().catch((err) => this.emit('error', err));
   }
 
   /**
-   * Apply the buffered delta immediately. Safe to call directly; overlapping
-   * calls are serialized.
+   * Apply the buffered delta, or catch up slots that are behind, immediately.
+   * Safe to call directly; overlapping calls are serialized.
    * @returns {Promise<import('./intraslot').PublishResult|null>} null if nothing was pending
    */
   async flush() {
@@ -131,7 +140,7 @@ class Coalescer extends EventEmitter {
       await this._inflight;
       return null;
     }
-    if (this.pending === 0) return null;
+    if (!this._hasWork()) return null;
 
     const add = this._add;
     const remove = this._remove;
@@ -145,16 +154,19 @@ class Coalescer extends EventEmitter {
 
     this._inflight = (async () => {
       try {
-        const result = await this.fanout.applyDelta({ add, remove });
+        const result = add.size || remove.size
+          ? await this.fanout.applyDelta({ add, remove })
+          : { ...(await this.fanout.catchUp()), ms: 0, failed: 0 };
         /**
          * @event Coalescer#flush
          * @type {{ added: number, removed: number, ms: number, failed: number }}
+         * `failed` counts slots still behind, which later ticks retry.
          */
         this.emit('flush', {
           added: add.size,
           removed: remove.size,
           ms: result.ms,
-          failed: result.failed,
+          failed: result.behind ?? result.failed,
         });
         return result;
       } catch (err) {
@@ -167,7 +179,8 @@ class Coalescer extends EventEmitter {
         throw err;
       } finally {
         this._flushing = false;
-        // Changes queued meanwhile, or a failed delta put back, go next tick.
+        // Changes queued meanwhile, a failed delta put back, or slots still
+        // behind go next tick.
         this._schedule();
       }
     })();
@@ -185,7 +198,7 @@ class Coalescer extends EventEmitter {
     if (this._timer) clearTimeout(this._timer);
     this._timer = null;
     if (this._flushing) await this._inflight.catch(() => {});
-    if (this.pending) await this.flush();
+    if (this._hasWork()) await this.flush();
   }
 }
 

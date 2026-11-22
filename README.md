@@ -181,6 +181,18 @@ sets pay it: a change that arrives when no flush has started for a tick is
 applied at once, so a rarely changing set sees its writes land in about one
 fanout's time (~20 ms above) rather than up to `tickMs`.
 
+Slots a write fails on, such as those on a node that timed out, are kept
+behind by the `IntraSlot` and retried with every later write through it, and by
+the coalescer's next tick even when nothing new arrives (or call `catchUp()`).
+Until they catch up, later deltas are folded into what they missed instead of
+sent to them, so they end up as if they had seen every write in order; a
+`publish`, `clear` or `reconcile` that covers them supersedes it. `behind`, and
+the `flush` event's `failed`, count slots still behind. What they missed grows
+with every member changed meanwhile, and the whole of it is resent each retry,
+so a long outage under heavy churn costs memory and bandwidth until the node
+returns. A process that exits while slots are behind loses track of them;
+`verify()` and `reconcile()` are the backstop.
+
 ### One writer per set
 
 An `IntraSlot` instance applies its writes one at a time, in the order they were
@@ -197,7 +209,7 @@ to per-event `add()` calls so the queue cannot grow without bound.
 
 ```js
 const report = await active.verify({ sample: 512 });
-// { sampled, cardinalities, majority, drifted: [slot...], consistent }
+// { sampled, cardinalities, majority, drifted: [slot...], consistent, contents }
 
 if (!report.consistent) {
   await active.reconcile(authoritativeMembers);  // repairs only drifted slots
@@ -205,8 +217,22 @@ if (!report.consistent) {
 ```
 
 A partial publish, a crashed publisher, or a replica restored from an old
-snapshot all show up as cardinality drift. `reconcile()` republishes to the
-affected slots only.
+snapshot all show up as drift. Replicas are compared by a digest of their
+members computed on the server, so a replica with the right number of the wrong
+members is caught too (`contents: true`). The digest script is read-only, so
+it still runs on a master refusing writes. A replica that cannot be read, such
+as a key of the wrong type, counts as drifted, and `verify` throws if it could
+read none of its sample. Against a server that refuses scripts, only
+cardinalities are compared and `contents` is false. `reconcile()` republishes
+to the affected slots only.
+
+Digesting costs a SHA-1 per member, so checking every replica is not cheap:
+`verify({ sample: 0 })`, which `reconcile()` runs when not given slots, took
+about 1 s for a 200-member set and 12 s for a 2000-member set on the 3-node
+cluster above. Each call stops once it has read `scriptBudget / 16` members,
+finishing the replica it is on, so a few ms of blocking for replicas of
+ordinary size, and calls go one at a time per node. A node that fails the call
+outright has its sampled slots reported as drifted rather than retried.
 
 ## API
 
@@ -226,8 +252,9 @@ slot.
 | `assertSameSlot(keys)` | — | throws `CrossSlotError` with an explanation |
 | `smembers` / `sismember` / `scard` | | read the replica local to a key |
 | `publish(members)` | replace everywhere; atomic per replica |
-| `add` / `remove` / `applyDelta` | incremental fanout |
+| `add` / `remove` / `applyDelta(delta, {slots})` | incremental fanout, optionally to chosen slots |
 | `clear()` | delete every replica |
+| `catchUp()` / `behind` | retry / count slots that missed writes |
 | `verify({sample})` | drift report |
 | `reconcile(members, [slots])` | repair drifted replicas |
 | `coalescer(opts)` | tick-based publisher for high churn |
