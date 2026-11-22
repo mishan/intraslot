@@ -29,6 +29,8 @@ const { CrossSlotError, PartialPublishError } = require('./errors');
  * @property {number} failed    replicas that errored
  * @property {number} ms        wall time
  * @property {number[]} failedSlots
+ * @property {number} [behind] slots still waiting to catch up after this write,
+ *   from it or an earlier one
  */
 
 const DEFAULTS = {
@@ -48,20 +50,26 @@ const TAG_WIDTH = 6;
 const PACKED_TAGS = TAGS.map((t) => t.padEnd(TAG_WIDTH)).join('');
 const TAG_LENGTHS = TAGS.map((t) => t.length).join('');
 
-// Writes the replicas in some slot ranges on one node, building their names
+// Works on the replicas in some slot ranges on one node, building their names
 // from the embedded table, so neither key names nor a command per replica cross
-// the wire. Each replica is replaced (UNLINK, then SADD) or changed by a delta
-// (SREM, then SADD); a script runs atomically, so readers never see a replica
-// half-replaced. UNLINK rather than DEL so a large old set is freed in the
-// background instead of inside the call, which scriptBudget does not count. No keys are declared because allow-cross-slot-keys still
-// rejects declared KEYS from different slots, and the same rule keeps COPY from
-// cloning one replica into another.
+// the wire. Each replica is replaced (UNLINK, then SADD), changed by a delta
+// (SREM, then SADD), or read back as a digest of its members. A script runs
+// atomically, so readers never see a replica half-replaced. UNLINK rather than
+// DEL so a large old set is freed in the background instead of inside the call,
+// which scriptBudget does not count. No keys are declared because
+// allow-cross-slot-keys still rejects declared KEYS from different slots, and
+// the same rule keeps COPY from cloning one replica into another.
 // unpack() is chunked to stay under Lua's C stack limit (~8000 values).
-// ARGV: key prefix + name, replace (1/0), nranges, nremove, nadd,
-//       (first slot, last slot) x nranges, removals..., additions...
-const WRITE_SCRIPT = `#!lua flags=allow-cross-slot-keys
+// A digest is "<cardinality>:<XOR of the first 64 bits of each member's SHA-1>",
+// so it ignores member order and does not depend on the server's collation
+// locale, as sorting the members would. A replica that cannot be read digests
+// as "?". A digest call stops once it has read nremove members (at least one
+// replica), so the caller learns how far it got from the length of the reply.
+// ARGV: key prefix + name, op (1 replace, 0 delta, d digest), nranges, nremove,
+//       nadd, (first slot, last slot) x nranges, removals..., additions...
+const SCRIPT_BODY = `
 local TAGS, LENGTHS = "${PACKED_TAGS}", "${TAG_LENGTHS}"
-local head, replace = ARGV[1] .. ':{', ARGV[2] == '1'
+local head, op = ARGV[1] .. ':{', ARGV[2]
 local ng, nr, na = tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
 local base = 6 + 2 * ng
 local function apply(cmd, key, from, n)
@@ -69,37 +77,110 @@ local function apply(cmd, key, from, n)
     redis.call(cmd, key, unpack(ARGV, i, math.min(i + 4095, from + n - 1)))
   end
 end
+local function digest(key)
+  local members = redis.pcall('SMEMBERS', key)
+  if members.err then return '?', 1 end
+  local h = {0, 0}
+  for _, m in ipairs(members) do
+    local sha = redis.sha1hex(m)
+    for w = 1, 2 do h[w] = bit.bxor(h[w], tonumber(string.sub(sha, 8 * w - 7, 8 * w), 16)) end
+  end
+  for w = 1, 2 do h[w] = bit.tohex(h[w]) end
+  return #members .. ':' .. table.concat(h), #members
+end
+local digests, read = {}, 0
 for g = 0, ng - 1 do
   for slot = tonumber(ARGV[6 + 2 * g]), tonumber(ARGV[7 + 2 * g]) do
     local at = slot * ${TAG_WIDTH} + 1
     local len = string.byte(LENGTHS, slot + 1) - 48
     local key = head .. string.sub(TAGS, at, at + len - 1) .. '}'
-    if replace then redis.call('UNLINK', key) end
-    apply('SREM', key, base, nr)
-    apply('SADD', key, base + nr, na)
+    if op == 'd' then
+      local d, n = digest(key)
+      digests[#digests + 1] = d
+      read = read + math.max(1, n)
+      if read >= nr then return digests end
+    else
+      if op == '1' then redis.call('UNLINK', key) end
+      apply('SREM', key, base, nr)
+      apply('SADD', key, base + nr, na)
+    end
   end
 end
-return 1`;
+return op == 'd' and digests or 1`;
+const WRITE_SCRIPT = `#!lua flags=allow-cross-slot-keys${SCRIPT_BODY}`;
 const WRITE_SHA = crypto.createHash('sha1').update(WRITE_SCRIPT).digest('hex');
+// Digests only, flagged no-writes so it still runs on a master refusing writes
+// (OOM, MISCONF, too few replicas).
+const READ_SCRIPT = `#!lua flags=no-writes,allow-cross-slot-keys${SCRIPT_BODY}`;
+const READ_SHA = crypto.createHash('sha1').update(READ_SCRIPT).digest('hex');
 
-/** In-flight SCRIPT LOADs, by server address. @type {Map<string, Promise<string>>} */
+/** In-flight SCRIPT LOADs, by server address and script. @type {Map<string, Promise<string>>} */
 const loading = new Map();
 
 /**
- * SCRIPT LOAD the write script on `node`, sharing one load among every call
- * that found it missing, from any instance, rather than resending the ~115 KB
- * body with each.
+ * SCRIPT LOAD `script` on `node`, sharing one load among every call that found
+ * it missing, from any instance, rather than resending the ~115 KB body with
+ * each.
  * @param {Redis} node
+ * @param {string} script
  * @returns {Promise<string>}
  */
-function loadScript(node) {
-  const addr = `${node.options.host}:${node.options.port}`;
-  let load = loading.get(addr);
+function loadScript(node, script) {
+  // Per user too: one whose ACL refuses SCRIPT LOAD must not fail another's.
+  const user = node.options.username || '';
+  const id = `${node.options.host}:${node.options.port} ${user} ${script === READ_SCRIPT ? 'read' : 'write'}`;
+  let load = loading.get(id);
   if (!load) {
-    load = node.script('LOAD', WRITE_SCRIPT).finally(() => loading.delete(addr));
-    loading.set(addr, load);
+    load = node.script('LOAD', script).finally(() => loading.delete(id));
+    loading.set(id, load);
   }
   return load;
+}
+
+/**
+ * EVALSHA `script` on `node`, or through the cluster client when `routeKey` is
+ * given, loading it first where it is missing.
+ * @param {Redis | Cluster} target
+ * @param {string} script
+ * @param {(string|number)[]} args
+ * @param {string} [routeKey] a key declared only so the cluster client routes the call
+ * @returns {Promise<any>}
+ */
+function evalScript(target, script, args, routeKey) {
+  const sha = script === READ_SCRIPT ? READ_SHA : WRITE_SHA;
+  const keys = routeKey ? [1, routeKey] : [0];
+  return target.evalsha(sha, ...keys, ...args).catch(async (err) => {
+    if (!/^NOSCRIPT/.test(err.message)) throw err;
+    // Through the cluster client the node is not known, so send the body once.
+    if (routeKey) return target.eval(script, ...keys, ...args);
+    await loadScript(target, script);
+    return target.evalsha(sha, ...keys, ...args);
+  });
+}
+
+/**
+ * A copy of a write's pending changes, safe to fold into.
+ * @param {{ replace: boolean, add: Set<string>, remove: Set<string> }} write
+ */
+function copyPending(write) {
+  return { replace: write.replace, add: new Set(write.add), remove: new Set(write.remove) };
+}
+
+/**
+ * Fold a later delta into what a slot is waiting for, last write winning per
+ * member. Into a pending replacement it edits the members to write.
+ * @param {{ replace: boolean, add: Set<string>, remove: Set<string> }} pending
+ * @param {{ add: Set<string>, remove: Set<string> }} delta
+ */
+function foldInto(pending, delta) {
+  for (const m of delta.remove) {
+    pending.add.delete(m);
+    if (!pending.replace) pending.remove.add(m);
+  }
+  for (const m of delta.add) {
+    pending.remove.delete(m);
+    pending.add.add(m);
+  }
 }
 
 /**
@@ -160,6 +241,11 @@ class IntraSlot {
     this._lastWrite = Promise.resolve();
     /** Cleared once a server shows it cannot run WRITE_SCRIPT. @type {boolean} */
     this._useScript = true;
+    /**
+     * Groups of slots that missed writes, each with what it still needs.
+     * @type {{ slots: number[], replace: boolean, add: Set<string>, remove: Set<string> }[]}
+     */
+    this._behind = [];
   }
 
   // -- addressing ----------------------------------------------------------
@@ -329,9 +415,10 @@ class IntraSlot {
    * writes can be pipelined.
    *
    * @private
+   * @param {Set<number>} [only] group just these slots
    * @returns {Map<Redis, number[]>} node -> slot numbers
    */
-  _groupSlotsByNode() {
+  _groupSlotsByNode(only) {
     const masters = this.cluster.nodes('master');
     /** @type {Map<string, Redis>} */
     const byAddr = new Map();
@@ -341,6 +428,7 @@ class IntraSlot {
     const groups = new Map();
     const slotMap = this.cluster.slots;
     for (let slot = 0; slot < NUM_SLOTS; slot++) {
+      if (only && !only.has(slot)) continue;
       const owner = slotMap && slotMap[slot] && slotMap[slot][0];
       const node = owner && byAddr.get(owner);
       // Unknown owner (mid-failover, say): fall through to the cluster client,
@@ -350,19 +438,6 @@ class IntraSlot {
       groups.get(target).push(slot);
     }
     return groups;
-  }
-
-  /**
-   * Run `build(pipeline, slot, keyPrefix)` across every replica, batched per
-   * node. With `write`, each node applies it in script calls covering many
-   * replicas each, and `build` is only the fallback.
-   * @private
-   * @param {(p: any, slot: number, keyPrefix: string) => void} build
-   * @param {{ replace?: boolean, remove: string[], add: string[] }} [write]
-   * @returns {Promise<PublishResult>}
-   */
-  _fanout(build, write) {
-    return this._serialize(() => this._fanoutNow(build, write));
   }
 
   /**
@@ -380,10 +455,19 @@ class IntraSlot {
     return run;
   }
 
-  /** @private */
-  async _fanoutNow(build, write) {
+  /**
+   * Run `build(pipeline, slot, keyPrefix)` across every replica, batched per
+   * node. With `write`, each node applies it in script calls covering many
+   * replicas each, and `build` is only the fallback. Callers serialize.
+   * @private
+   * @param {(p: any, slot: number, keyPrefix: string) => void} build
+   * @param {{ replace?: boolean, remove: string[], add: string[] }} [write]
+   * @param {Set<number>} [only] write just these slots
+   * @returns {Promise<PublishResult>}
+   */
+  async _fanoutNow(build, write, only) {
     const t0 = process.hrtime.bigint();
-    const groups = this._groupSlotsByNode();
+    const groups = this._groupSlotsByNode(only);
     const { chunkSize, scriptBudget } = this.opts;
 
     /** @type {Promise<{ slots: number[], results?: any[], error?: Error }>[]} */
@@ -454,7 +538,7 @@ class IntraSlot {
 
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
     return {
-      replicas: NUM_SLOTS - failedSlots.length,
+      replicas: (only ? only.size : NUM_SLOTS) - failedSlots.length,
       failed: failedSlots.length,
       failedSlots,
       ms,
@@ -467,18 +551,8 @@ class IntraSlot {
    * @private
    */
   async _viaScript(node, batch, write, viaPipeline) {
-    const ranges = slotRanges(batch);
-    // ioredis prefixes declared KEYS only, and the script builds its own.
-    const args = [
-      this._keyPrefix + this.name, write.replace ? 1 : 0, ranges.length / 2,
-      write.remove.length, write.add.length, ...ranges, ...write.remove, ...write.add,
-    ];
     try {
-      await node.evalsha(WRITE_SHA, 0, ...args).catch(async (err) => {
-        if (!/^NOSCRIPT/.test(err.message)) throw err;
-        await loadScript(node);
-        return node.evalsha(WRITE_SHA, 0, ...args);
-      });
+      await this._script(node, batch, write.replace ? '1' : '0', write.remove, write.add);
       return { slots: batch };
     } catch (err) {
       if (SCRIPT_REFUSED.test(err.message)) this._useScript = false;
@@ -489,7 +563,32 @@ class IntraSlot {
     }
   }
 
+  /**
+   * Run WRITE_SCRIPT with `op` on `slots`, all owned by `node`.
+   * @private
+   */
+  _script(node, slots, op, remove = [], add = []) {
+    const args = this._argv(op, slots, remove.length, add.length, [...remove, ...add]);
+    return evalScript(node, WRITE_SCRIPT, args);
+  }
+
+  /**
+   * The script's ARGV for `slots`.
+   * @private
+   * @returns {(string|number)[]}
+   */
+  _argv(op, slots, nremove, nadd, values = []) {
+    const ranges = slotRanges(slots);
+    // ioredis prefixes declared KEYS only, and the script builds its own.
+    return [this._keyPrefix + this.name, op, ranges.length / 2, nremove, nadd, ...ranges, ...values];
+  }
+
   // -- writes --------------------------------------------------------------
+
+  /** Slots that missed a write and are waiting to catch up. @returns {number} */
+  get behind() {
+    return this._behind.reduce((n, group) => n + group.slots.length, 0);
+  }
 
   /**
    * Replace the replicated set everywhere.
@@ -506,18 +605,7 @@ class IntraSlot {
    * @returns {Promise<PublishResult>}
    */
   async publish(members, opts = {}) {
-    const list = [...members];
-    const result = await this._fanout((p, slot, pre) => {
-      const key = pre + this.keys[slot];
-      if (list.length === 0) {
-        p.del(key);
-        return;
-      }
-      const staging = `${pre}${this.opts.stagingName}:{${TAGS[slot]}}`;
-      p.del(staging);
-      p.sadd(staging, ...list);
-      p.rename(staging, key);
-    }, { replace: true, remove: [], add: list });
+    const result = await this._write({ replace: true, add: new Set(members), remove: new Set() });
     if (result.failed && opts.throwOnPartial !== false) {
       throw new PartialPublishError(result.failed, NUM_SLOTS, [
         new Error(`slots ${result.failedSlots.slice(0, 5).join(', ')} ...`),
@@ -549,40 +637,138 @@ class IntraSlot {
    * a member that left and rejoined within the same delta ends up present.
    *
    * @param {{ add?: Iterable<string>, remove?: Iterable<string> }} delta
+   * @param {{ slots?: Iterable<number> }} [opts] apply to just these slots
    * @returns {Promise<PublishResult>}
    */
-  async applyDelta(delta) {
-    const toAdd = [...(delta.add || [])];
-    const toRemove = [...(delta.remove || [])].filter((m) => !toAdd.includes(m));
-    if (!toAdd.length && !toRemove.length) {
-      return { replicas: NUM_SLOTS, failed: 0, failedSlots: [], ms: 0 };
+  async applyDelta(delta, opts = {}) {
+    const add = new Set(delta.add || []);
+    const remove = new Set([...(delta.remove || [])].filter((m) => !add.has(m)));
+    const only = opts.slots ? new Set(opts.slots) : undefined;
+    for (const slot of only || []) {
+      if (!Number.isInteger(slot) || slot < 0 || slot >= NUM_SLOTS) {
+        throw new RangeError(`intraslot: ${JSON.stringify(slot)} is not a slot number`);
+      }
     }
-    return this._fanout((p, slot, pre) => {
-      const key = pre + this.keys[slot];
-      if (toRemove.length) p.srem(key, ...toRemove);
-      if (toAdd.length) p.sadd(key, ...toAdd);
-    }, { remove: toRemove, add: toAdd });
+    if (!add.size && !remove.size) {
+      return { replicas: only ? only.size : NUM_SLOTS, failed: 0, failedSlots: [], ms: 0, behind: this.behind };
+    }
+    return this._write({ replace: false, add, remove }, only);
   }
 
   /** Delete every replica. @returns {Promise<PublishResult>} */
   async clear() {
-    return this._fanout((p, slot, pre) => p.del(pre + this.keys[slot]), {
-      replace: true,
-      remove: [],
-      add: [],
+    return this._write({ replace: true, add: new Set(), remove: new Set() });
+  }
+
+  /**
+   * Retry the slots that missed earlier writes, without writing anything new.
+   * Every write retries them too; this is for when there is nothing to write.
+   * @returns {Promise<{ behind: number }>} slots still behind afterwards
+   */
+  catchUp() {
+    return this._serialize(async () => {
+      await this._writeNow(null);
+      return { behind: this.behind };
     });
+  }
+
+  /** @private */
+  _write(write, targets) {
+    return this._serialize(() => this._writeNow(write, targets));
+  }
+
+  /**
+   * Apply `write` (a replacement or a delta) to `targets`, every slot when
+   * omitted, then retry the slots that missed earlier writes.
+   *
+   * A slot that misses a write is kept behind with what it missed. A later
+   * delta is folded into that rather than sent to it, so when the slot catches
+   * up it ends as if it had seen every write in order; a later replacement
+   * supersedes it. This holds for every write through this instance, which is
+   * why it lives here rather than in the coalescer.
+   *
+   * @private
+   * @param {{ replace: boolean, add: Set<string>, remove: Set<string> } | null} write
+   * @param {Set<number>} [targets]
+   * @returns {Promise<PublishResult & { behind: number }>} the result for `write`
+   */
+  async _writeNow(write, targets) {
+    const covers = (slot) => !targets || targets.has(slot);
+    /** @type {{ slots: number[], replace: boolean, add: Set<string>, remove: Set<string> }[]} */
+    const retry = [];
+    /** @type {Set<number>} */
+    const folded = new Set();
+    for (const group of this._behind) {
+      const covered = write ? group.slots.filter(covers) : [];
+      const rest = covered.length ? group.slots.filter((slot) => !covers(slot)) : group.slots;
+      if (rest.length) retry.push({ ...group, slots: rest });
+      if (!covered.length || write.replace) continue;
+      // Copy before folding when the group was split, so the halves stay apart.
+      const own = rest.length ? copyPending(group) : group;
+      foldInto(own, write);
+      retry.push({ ...own, slots: covered });
+      for (const slot of covered) folded.add(slot);
+    }
+
+    let result = null;
+    const next = [];
+    if (write) {
+      let only = targets;
+      if (folded.size) {
+        only = new Set();
+        for (let slot = 0; slot < NUM_SLOTS; slot++) if (covers(slot) && !folded.has(slot)) only.add(slot);
+      }
+      result = await this._apply(write, only);
+      if (result.failedSlots.length) next.push({ ...copyPending(write), slots: result.failedSlots });
+    }
+    for (const group of retry) {
+      const { failedSlots } = await this._apply(group, new Set(group.slots));
+      if (failedSlots.length) next.push({ ...group, slots: failedSlots });
+    }
+    this._behind = next;
+    return result && { ...result, behind: this.behind };
+  }
+
+  /**
+   * Write `write` to `only`, every slot when omitted.
+   * @private
+   */
+  _apply(write, only) {
+    const add = [...write.add];
+    if (write.replace) {
+      return this._fanoutNow((p, slot, pre) => {
+        const key = pre + this.keys[slot];
+        if (!add.length) {
+          p.del(key);
+          return;
+        }
+        const staging = `${pre}${this.opts.stagingName}:{${TAGS[slot]}}`;
+        p.del(staging);
+        p.sadd(staging, ...add);
+        p.rename(staging, key);
+      }, { replace: true, remove: [], add }, only);
+    }
+    const remove = [...write.remove];
+    return this._fanoutNow((p, slot, pre) => {
+      const key = pre + this.keys[slot];
+      if (remove.length) p.srem(key, ...remove);
+      if (add.length) p.sadd(key, ...add);
+    }, { remove, add }, only);
   }
 
   // -- operations ----------------------------------------------------------
 
   /**
    * Sample replicas and report divergence. A partial publish, a node restored
-   * from an old snapshot, or a crashed publisher all show up as cardinality
-   * drift.
+   * from an old snapshot, or a crashed publisher all show up as drift.
+   *
+   * Replicas are compared by a digest of their members, so one holding the
+   * right number of the wrong members is caught too. On a server that refuses
+   * scripts only cardinalities are compared, and `contents` is false.
    *
    * @param {{ sample?: number }} [opts] slots to sample (default 256; 0 = all)
    * @returns {Promise<{ sampled: number, cardinalities: Record<number, number>,
-   *   majority: number, drifted: number[], consistent: boolean }>}
+   *   majority: number, drifted: number[], consistent: boolean, contents: boolean }>}
    */
   async verify(opts = {}) {
     const n = opts.sample === 0 ? NUM_SLOTS : opts.sample || 256;
@@ -591,23 +777,94 @@ class IntraSlot {
     const slots = [];
     for (let s = 0; s < NUM_SLOTS; s += step) slots.push(s);
 
-    const counts = await Promise.all(slots.map((s) => this.cluster.scard(this.keys[s])));
+    const contents = this._useScript;
+    const states = contents
+      ? await this._digests(slots)
+      : await Promise.all(slots.map((s) => this.cluster.scard(this.keys[s]).then(String, () => '?')));
+    // A server that refused the script partway leaves no digests to compare.
+    if (contents && !this._useScript) return this.verify(opts);
 
     /** @type {Record<number, number>} */
     const histogram = {};
-    for (const c of counts) histogram[c] = (histogram[c] || 0) + 1;
-    const majority = Number(
-      Object.entries(histogram).sort((a, b) => b[1] - a[1])[0][0]
-    );
-    const drifted = slots.filter((_, i) => counts[i] !== majority);
+    /** @type {Map<string, number>} */
+    const tally = new Map();
+    for (const state of states) {
+      if (state === '?') continue;
+      const card = parseInt(state, 10);
+      histogram[card] = (histogram[card] || 0) + 1;
+      tally.set(state, (tally.get(state) || 0) + 1);
+    }
+    // Rather than report all-unreadable as consistent, or flag every replica.
+    if (!tally.size) throw new Error('intraslot: verify could not read any sampled replica');
+    const common = [...tally].sort((a, b) => b[1] - a[1])[0][0];
+    // An unreadable replica is never in the majority, so it counts as drifted.
+    const drifted = slots.filter((_, i) => states[i] !== common);
 
     return {
       sampled: slots.length,
       cardinalities: histogram,
-      majority,
+      majority: parseInt(common, 10),
       drifted,
       consistent: drifted.length === 0,
+      contents,
     };
+  }
+
+  /**
+   * Each slot's digest, in order, or "?" for a slot whose replica could not be
+   * read.
+   * @private
+   * @param {number[]} slots
+   * @returns {Promise<string[]>}
+   */
+  async _digests(slots) {
+    // Digesting a member costs up to about 16 writes (measured: a SHA-1 and some
+    // Lua per member), so a call stops after scriptBudget / 16 members.
+    const budget = Math.max(1, Math.floor(this.opts.scriptBudget / 16));
+    /** @type {Map<number, string>} */
+    const bySlot = new Map();
+    /** @type {number[]} */
+    const retry = [];
+    // One call in flight per node. Calls this small would otherwise queue in the
+    // node's input buffer and run back to back, starving its cluster bus for
+    // long enough that the cluster marks it failed.
+    const jobs = [...this._groupSlotsByNode(new Set(slots))].map(async ([node, owned]) => {
+      // Unknown owner (mid-failover, say): let the cluster client route each.
+      if (!node) return void retry.push(...owned);
+      // Send about as many slots as the last call got through, not chunkSize
+      // every time when replicas are large.
+      let size = this.opts.chunkSize;
+      for (let i = 0; i < owned.length; ) {
+        const batch = owned.slice(i, i + size);
+        let out;
+        try {
+          out = await evalScript(node, READ_SCRIPT, this._argv('d', batch, budget, 0));
+        } catch (err) {
+          // The node itself failed (down, busy, refusing scripts): its slots are
+          // unreadable now, and retrying each through the cluster would only
+          // wait out the client's retries slot by slot.
+          if (SCRIPT_REFUSED.test(err.message)) this._useScript = false;
+          return;
+        }
+        out.forEach((state, j) => (state === '?' ? retry.push(batch[j]) : bySlot.set(batch[j], state)));
+        i += out.length;
+        size = Math.min(this.opts.chunkSize, 2 * out.length);
+      }
+    });
+    await Promise.all(jobs);
+    // Then a few at a time through the cluster client, which follows
+    // redirects, for replicas the script could not read where it ran.
+    for (let i = 0; i < retry.length && this._useScript; i += 8) {
+      await Promise.all(retry.slice(i, i + 8).map(async (slot) => {
+        const args = this._argv('d', [slot], budget, 0);
+        const out = await evalScript(this.cluster, READ_SCRIPT, args, this.keys[slot]).catch((err) => {
+          if (SCRIPT_REFUSED.test(err.message)) this._useScript = false;
+          return ['?'];
+        });
+        bySlot.set(slot, out[0]);
+      }));
+    }
+    return slots.map((slot) => bySlot.get(slot) || '?');
   }
 
   /**
@@ -629,20 +886,10 @@ class IntraSlot {
     }
     if (!targets.length) return { repaired: [] };
 
-    const list = [...members];
-    await Promise.all(
-      targets.map(async (slot) => {
-        const key = this.keys[slot];
-        const staging = `${this.opts.stagingName}:{${TAGS[slot]}}`;
-        if (!list.length) return this.cluster.del(key);
-        const p = this.cluster.pipeline();
-        p.del(staging);
-        p.sadd(staging, ...list);
-        p.rename(staging, key);
-        return p.exec();
-      })
-    );
-    return { repaired: targets };
+    const write = { replace: true, add: new Set(members), remove: new Set() };
+    const { failedSlots } = await this._writeNow(write, new Set(targets));
+    const failed = new Set(failedSlots);
+    return { repaired: targets.filter((slot) => !failed.has(slot)) };
   }
 
   /**

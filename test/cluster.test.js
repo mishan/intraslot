@@ -135,6 +135,91 @@ test('add and remove fan out to every replica', async () => {
   }
 });
 
+test('applyDelta can target chosen slots', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setV' });
+  await fan.publish(['a']);
+  const result = await fan.applyDelta({ add: ['b'] }, { slots: [7, 12000] });
+  assert.strictEqual(result.replicas, 2);
+  const report = await fan.verify({ sample: 0 });
+  assert.deepStrictEqual(report.drifted.sort((x, y) => x - y), [7, 12000]);
+  assert.deepStrictEqual((await cluster.smembers(fan.keys[7])).sort(), ['a', 'b']);
+  for (const bad of [99999, -1, '4', 1.5]) {
+    await assert.rejects(() => fan.applyDelta({ add: ['z'] }, { slots: [3, bad] }), RangeError);
+  }
+});
+
+test('slots that miss writes catch up as if they had seen every write in order', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setBA' });
+  await fan.publish(['v']);
+  const slot = 4242;
+  await cluster.set(fan.keys[slot], 'not a set'); // fails every write until deleted
+  try {
+    assert.deepStrictEqual((await fan.add(['w', 'x'])).failedSlots, [slot]);
+    assert.strictEqual((await fan.applyDelta({ remove: ['v', 'x'], add: ['y'] })).behind, 1);
+  } finally {
+    await cluster.del(fan.keys[slot]);
+  }
+  await cluster.sadd(fan.keys[slot], 'v'); // as if the replica came back as it was
+
+  assert.deepStrictEqual(await fan.catchUp(), { behind: 0 });
+  assert.deepStrictEqual((await cluster.smembers(fan.keys[slot])).sort(), ['w', 'y']);
+  assert.ok((await fan.verify({ sample: 0 })).consistent);
+});
+
+test('a targeted write to some behind slots leaves the others as they were', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setBD' });
+  await fan.publish([]);
+  const [one, other] = [4242, 4243];
+  await Promise.all([one, other].map((slot) => cluster.set(fan.keys[slot], 'not a set')));
+  try {
+    await fan.add(['x']); // both fall behind together
+    await fan.applyDelta({ add: ['y'] }, { slots: [one] });
+  } finally {
+    await Promise.all([one, other].map((slot) => cluster.del(fan.keys[slot])));
+  }
+  await fan.catchUp();
+  assert.deepStrictEqual((await cluster.smembers(fan.keys[one])).sort(), ['x', 'y']);
+  assert.deepStrictEqual(await cluster.smembers(fan.keys[other]), ['x']);
+});
+
+test('a publish supersedes what a behind slot missed', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setBB' });
+  await fan.publish([]);
+  const slot = 4242;
+  await cluster.set(fan.keys[slot], 'not a set');
+  const c = fan.coalescer({ tickMs: 20 });
+  try {
+    c.add('x');
+    await c.flush();
+    assert.strictEqual(fan.behind, 1);
+    await fan.publish(['p']); // replaces the wrong-typed key too
+    assert.strictEqual(fan.behind, 0);
+    await sleep(100);
+  } finally {
+    await c.close();
+  }
+  const report = await fan.verify({ sample: 0 });
+  assert.ok(report.consistent);
+  assert.strictEqual(report.majority, 1);
+});
+
+test('a slot that keeps failing stays behind once, costing one retry per write', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setBC' });
+  await fan.publish(['a']);
+  const slot = 4242;
+  await cluster.set(fan.keys[slot], 'not a set');
+  try {
+    for (let i = 0; i < 20; i++) await fan.add([`m${i}`]);
+    const before = await scriptCalls();
+    const result = await fan.add(['final']);
+    assert.strictEqual(result.behind, 1);
+    // ~16 script calls for the delta plus one retry, not one per earlier write.
+    assert.ok((await scriptCalls()) - before < 25, 'retries piled up');
+  } finally {
+    await cluster.del(fan.keys[slot]);
+  }
+});
+
 test('applyDelta orders removals before additions', async () => {
   const fan = new IntraSlot(cluster, { name: 'set8' });
   await fan.publish(['a', 'b']);
@@ -330,6 +415,17 @@ test('a server that refuses scripts is not asked again', async () => {
     await fan.add(['c']);
     assert.strictEqual(await rejectedScripts(limited), before);
     assert.deepStrictEqual((await fan.smembers(SUBS)).sort(), ['a', 'b', 'c']);
+
+    // Without scripts, verify can still compare sizes, and finds a short replica.
+    await cluster.srem(fan.keys[1024], 'a');
+    const report = await fan.verify({ sample: 16 });
+    assert.strictEqual(report.contents, false);
+    assert.deepStrictEqual(report.drifted, [1024]);
+
+    // An instance that has not yet met the refusal learns it inside verify.
+    const fresh = await new IntraSlot(limited, { name: 'setJ' }).verify({ sample: 16 });
+    assert.strictEqual(fresh.contents, false);
+    assert.deepStrictEqual(fresh.drifted, [1024]);
   } finally {
     limited.disconnect();
     await acl('DELUSER', 'noeval');
@@ -394,6 +490,124 @@ test('reconcile waits for writes already in flight', async () => {
   await delta;
   await cluster.del(fan.keys[victimSlot]);
   assert.deepStrictEqual(await cluster.smembers(fan.keys[neighbor]), ['a']);
+});
+
+test('verify catches a replica with the right size but the wrong members', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setU' });
+  await fan.publish(['a', 'b']);
+  const victimSlot = 4242;
+  await cluster.srem(fan.keys[victimSlot], 'a');
+  await cluster.sadd(fan.keys[victimSlot], 'c');
+
+  const report = await fan.verify({ sample: 0 });
+  assert.strictEqual(report.contents, true);
+  assert.deepStrictEqual(report.drifted, [victimSlot]);
+
+  assert.deepStrictEqual((await fan.reconcile(['a', 'b'])).repaired, [victimSlot]);
+  assert.ok((await fan.verify({ sample: 0 })).consistent);
+});
+
+test('verify flags an unreadable replica, even at slot 0, and reconcile repairs it', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setW' });
+  await fan.publish(['a', 'b']);
+  await cluster.set(fan.keys[0], 'not a set');
+
+  const report = await fan.verify({ sample: 0 });
+  assert.deepStrictEqual(report.drifted, [0]);
+  assert.strictEqual(report.majority, 2);
+
+  assert.deepStrictEqual((await fan.reconcile(['a', 'b'])).repaired, [0]);
+  assert.ok((await fan.verify({ sample: 0 })).consistent);
+});
+
+test('verify refuses to report a sample it could not read at all', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setAA' });
+  // verify({ sample: 16 }) reads every 1024th slot.
+  const sampled = Array.from({ length: 16 }, (_, i) => i * 1024);
+  await Promise.all(sampled.map((slot) => cluster.set(fan.keys[slot], 'not a set')));
+  try {
+    await assert.rejects(() => fan.verify({ sample: 16 }), /could not read any sampled replica/);
+  } finally {
+    await Promise.all(sampled.map((slot) => cluster.del(fan.keys[slot])));
+  }
+});
+
+test('verify with an unreadable replica stays cheap on the wire', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setX' });
+  await fan.publish(['a']);
+  await cluster.set(fan.keys[100], 'not a set');
+  let report;
+  let sent;
+  try {
+    const before = await netInputBytes();
+    report = await fan.verify({ sample: 0 });
+    sent = (await netInputBytes()) - before;
+  } finally {
+    await cluster.del(fan.keys[100]);
+  }
+  assert.deepStrictEqual(report.drifted, [100]);
+  assert.ok(sent < 1_000_000, `sent ${sent} bytes`);
+});
+
+test('verify still reads replicas while masters refuse writes', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setY' });
+  await fan.publish(['a', 'b']);
+  await cluster.srem(fan.keys[42], 'a');
+  await cluster.sadd(fan.keys[42], 'c');
+  const masters = cluster.nodes('master');
+  const previous = await Promise.all(masters.map((n) => n.config('GET', 'maxmemory')));
+  await Promise.all(masters.map((n) => n.config('SET', 'maxmemory', '1')));
+  let report;
+  try {
+    report = await fan.verify({ sample: 0 });
+  } finally {
+    await Promise.all(masters.map((n, i) => n.config('SET', 'maxmemory', previous[i][1])));
+  }
+  assert.strictEqual(report.contents, true);
+  assert.deepStrictEqual(report.drifted, [42]);
+});
+
+test('verify sizes digest calls by members read, not by one replica', async () => {
+  // A budget of 1600 writes is 100 members' digests per call.
+  const fan = new IntraSlot(cluster, { name: 'setZ', scriptBudget: 1600 });
+  await fan.publish(Array.from({ length: 50 }, (_, i) => `user${i}`));
+  await cluster.del(fan.keys[0]); // an empty slot 0 must not inflate every call
+  const before = await scriptCalls();
+  const report = await fan.verify({ sample: 0 });
+  assert.deepStrictEqual(report.drifted, [0]);
+  // 16384 replicas of 50 members at 100 members per call, give or take.
+  const calls = (await scriptCalls()) - before;
+  assert.ok(calls >= 16384 / 2 - 100 && calls <= 16384 / 2 + 100, `${calls} calls`);
+});
+
+test('verify sends each call only the slots it can get through', async () => {
+  // 100 members' digests per call over 50-member replicas: 2 replicas a call.
+  const fan = new IntraSlot(cluster, { name: 'setBF', scriptBudget: 1600 });
+  await fan.publish(Array.from({ length: 50 }, (_, i) => `user${i}`));
+  const before = await netInputBytes();
+  const report = await fan.verify({ sample: 8192 }); // every other slot
+  const sent = (await netInputBytes()) - before;
+  assert.ok(report.consistent);
+  // Resending all of a 2048-slot batch's ranges each call would be ~80 MB.
+  assert.ok(sent < 2_000_000, `sent ${sent} bytes`);
+});
+
+test('verify reads a slot that moved since the client last looked', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setBE' });
+  await fan.publish(['a', 'b']);
+  const slot = 100;
+  const masters = cluster.nodes('master');
+  const src = masters.findIndex((n) => cluster.slots[slot][0] === `${n.options.host}:${n.options.port}`);
+  const dst = (src + 1) % masters.length;
+  await (await startSlotMove(slot, src, dst))(); // the client's slot map is now stale
+  try {
+    const report = await fan.verify({ sample: 0 });
+    assert.strictEqual(report.contents, true);
+    assert.deepStrictEqual(report.drifted, []);
+  } finally {
+    await (await startSlotMove(slot, dst, src))();
+    await new Promise((resolve) => cluster.refreshSlotsCache(resolve));
+  }
 });
 
 test('verify detects a drifted replica and reconcile repairs it', async () => {
