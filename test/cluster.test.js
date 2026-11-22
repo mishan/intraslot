@@ -162,6 +162,37 @@ test('a small delta sends neither a command nor a key name per replica', async (
   assert.ok(sent < 16384, `sent ${sent} bytes for a +1/-1 delta`);
 });
 
+test('publish and clear send the members once per call, not once per replica', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setN' });
+  const members = Array.from({ length: 200 }, (_, i) => `user${i}`);
+  await fan.publish(['old']);
+
+  let before = await netInputBytes();
+  await fan.publish(members);
+  const published = (await netInputBytes()) - before;
+  before = await netInputBytes();
+  await fan.clear();
+  const cleared = (await netInputBytes()) - before;
+
+  // Sending 200 members to each of 16384 replicas would be over 25 MB.
+  assert.ok(published < 2_000_000, `publish sent ${published} bytes`);
+  assert.ok(cleared < 16384, `clear sent ${cleared} bytes`);
+  assert.strictEqual((await fan.verify({ sample: 0 })).majority, 0);
+});
+
+test('a script call writes at most scriptBudget members', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setO', scriptBudget: 1000 });
+  const calls = async () => {
+    const infos = await Promise.all(cluster.nodes('master').map((n) => n.info('commandstats')));
+    return infos.reduce((sum, s) => sum + Number((/cmdstat_evalsha:calls=(\d+)/.exec(s) || [0, 0])[1]), 0);
+  };
+  const before = await calls();
+  await fan.publish(Array.from({ length: 100 }, (_, i) => `user${i}`));
+  // 100 members within a budget of 1000 means 10 replicas per call.
+  assert.ok((await calls()) - before >= 16384 / 10);
+  assert.strictEqual((await fan.verify({ sample: 0 })).majority, 100);
+});
+
 test('a server without the script cached is sent it once, not per call', async () => {
   const fan = new IntraSlot(cluster, { name: 'setM' });
   await fan.publish(['a']);
@@ -414,8 +445,8 @@ for (const [label, opts] of [
         prefixed.once('ready', resolve);
         prefixed.once('error', reject);
       });
-      // chunkSize 64 sends deltas of more than 32 members down the pipeline.
-      const fan = new IntraSlot(prefixed, { name: 'setK', chunkSize: 64 });
+      // scriptBudget 64 sends writes of more than 32 members down the pipeline.
+      const fan = new IntraSlot(prefixed, { name: 'setK', scriptBudget: 64 });
       await fan.publish(['a']);
       await fan.applyDelta({ add: ['b'] });
       const many = Array.from({ length: 40 }, (_, i) => `m${i}`);

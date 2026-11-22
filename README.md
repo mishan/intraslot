@@ -151,24 +151,25 @@ Measured by `npm run bench` on a 3-node cluster sharing one sandbox CPU — a
 pessimistic floor:
 
 ```
-initial publish (200 members -> 16384 replicas): 1065 ms (15,383 keys/s)
+initial publish (200 members -> 16384 replicas):  138 ms (~119,000 keys/s)
 coalesced delta tick (+6/-4)                   :   23 ms (~1,450,000 replica writes/s)
 sustainable tick rate                          : ~44 Hz
 verify across 256 sampled replicas             : CONSISTENT
 ```
 
-So a 250 ms tick has roughly 10x headroom. Deltas are applied by a Lua script
+So a 250 ms tick has roughly 10x headroom. Writes go through a Lua script
 (`allow-cross-slot-keys`, Redis 7+) that embeds the slot table, so each call
-names a range of slots and the script builds the replica keys itself. Each call
-covers about `chunkSize / delta size` replicas, 204 for the delta above. Neither
-key names nor a command per replica cross the wire: the +6/-4 tick above sends
-about 20 KB, where per-replica commands send about 300 KB. That matters most
-where traffic is metered, such as across availability zones.
+names a range of slots and the script builds the replica keys itself. The
+members cross the wire once per call, and neither key names nor a command per
+replica do: the +6/-4 tick above sends about 2 KB, where per-replica commands
+send about 300 KB, and a 200-member publish sends about 0.3 MB instead of 42 MB.
+That is most of why publish is about 7x faster than per-replica commands.
 
-The ~115 KB script is loaded once per node and called by its SHA after that. A
-call that fails is replayed as plain per-replica commands. Deltas of more than
-`chunkSize / 2` members, and servers that refuse the script, use the plain
-commands throughout.
+Each call writes at most `scriptBudget` members (default 32768, a few ms of
+blocking per call), across at most `chunkSize` replicas. The ~115 KB script is
+loaded once per node and called by its SHA after that. A call that fails is
+replayed as plain per-replica commands. Writes of more than `scriptBudget / 2`
+members, and servers that refuse the script, use the plain commands throughout.
 
 Ticks never overlap, and a member added and removed within one tick resolves to
 the last write. The cost is staleness bounded by one tick — fine for presence,
@@ -218,16 +219,17 @@ slot.
 | `slotOf(key)` | — | slot number, per Redis's own rule |
 | `assertSameSlot(keys)` | — | throws `CrossSlotError` with an explanation |
 | `smembers` / `sismember` / `scard` | | read the replica local to a key |
-| `publish(members)` | replace everywhere; atomic per replica via staged `RENAME` |
+| `publish(members)` | replace everywhere; atomic per replica |
 | `add` / `remove` / `applyDelta` | incremental fanout |
 | `clear()` | delete every replica |
 | `verify({sample})` | drift report |
 | `reconcile(members, [slots])` | repair drifted replicas |
 | `coalescer(opts)` | tick-based publisher for high churn |
 
-`publish()` stages members under a co-slotted staging key and `RENAME`s it over
-the live key, so a reader sees either the old set or the new one — never a
-half-built one. The fanout as a whole is still eventually consistent; there is no
+`publish()` replaces each replica inside a script call, or on the per-replica
+fallback stages the members under a co-slotted key and `RENAME`s it over the live
+one, so a reader sees either the old set or the new one — never a half-built
+one. The fanout as a whole is still eventually consistent; there is no
 cross-slot transaction spanning 16384 slots, and there cannot be.
 
 ## Cost
