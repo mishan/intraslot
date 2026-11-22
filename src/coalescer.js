@@ -13,10 +13,10 @@ const { EventEmitter } = require('events');
 /**
  * Buffers membership changes and applies them once per tick.
  *
- * Fanning out per event costs `events/sec x 16384` commands and is hopeless past
- * a trickle. A tick costs `2 x 16384` commands no matter how many events it
- * absorbed, so the write cost becomes a function of tick rate rather than churn
- * rate. The price is staleness bounded by one tick -- fine for presence data,
+ * Fanning out per event costs `events/sec x 16384` replica writes and is
+ * hopeless past a trickle. A tick costs `2 x 16384` replica writes no matter how
+ * many events it absorbed, so the write cost becomes a function of tick rate
+ * rather than churn rate. The price is staleness bounded by one tick -- fine for presence data,
  * wrong wherever a stale read is incorrect rather than merely dated.
  *
  * Ticks never overlap: if a flush is still running when the timer fires, the

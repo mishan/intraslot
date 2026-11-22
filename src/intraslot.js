@@ -30,6 +30,28 @@ const { CrossSlotError, PartialPublishError } = require('./errors');
 
 const DEFAULTS = { stagingName: 'intraslot:staging', verify: true, chunkSize: 2048 };
 
+// Applies one delta to many replicas on one node, so the members cross the wire
+// once per call instead of once per replica. Key names go in ARGV because
+// allow-cross-slot-keys still rejects declared KEYS from different slots.
+// unpack() is chunked to stay under Lua's C stack limit (~8000 values).
+// ARGV: nkeys, nremove, nadd, keys..., removals..., additions...
+// Errors meaning this server will never run DELTA_SCRIPT for us.
+const SCRIPT_REFUSED =
+  /^(NOPERM|ERR unknown command|ERR Error compiling script|ERR Unexpected flag|ERR ACL failure in script)/;
+
+const DELTA_SCRIPT = `#!lua flags=allow-cross-slot-keys
+local nk, nr, na = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local function apply(cmd, key, from, n)
+  for i = from, from + n - 1, 4096 do
+    redis.call(cmd, key, unpack(ARGV, i, math.min(i + 4095, from + n - 1)))
+  end
+end
+for i = 4, 3 + nk do
+  apply('SREM', ARGV[i], 4 + nk, nr)
+  apply('SADD', ARGV[i], 4 + nk + nr, na)
+end
+return nk`;
+
 /**
  * A set replicated to all 16384 slots, so it can be intersected server-side
  * against any sharded key without a CROSSSLOT error.
@@ -65,6 +87,13 @@ class IntraSlot {
 
     /** All 16384 replica keys, precomputed once. @type {string[]} */
     this.keys = TAGS.map((t) => `${this.name}:{${t}}`);
+
+    /** The prefix ioredis adds to keys sent through the cluster client. @private */
+    this._keyPrefix = cluster.options?.keyPrefix || '';
+    /** Tail of the write queue. @private */
+    this._lastWrite = Promise.resolve();
+    /** Cleared once a server shows it cannot run DELTA_SCRIPT. @private */
+    this._useScript = true;
   }
 
   // -- addressing ----------------------------------------------------------
@@ -228,8 +257,10 @@ class IntraSlot {
   /**
    * Group all 16384 replica keys by the node that currently owns them.
    *
-   * A stale grouping is harmless: misrouted writes get a MOVED and ioredis
-   * retries. This exists purely so writes can be pipelined.
+   * A stale grouping is harmless: a write that gets MOVED or ASK is replayed
+   * through the cluster client. (A publish to a slot mid-migration can still
+   * fail, on TRYAGAIN, and is reported in `failedSlots`.) This exists purely so
+   * writes can be pipelined.
    *
    * @private
    * @returns {Map<Redis, number[]>} node -> slot numbers
@@ -256,40 +287,94 @@ class IntraSlot {
   }
 
   /**
-   * Run `build(pipeline, slot)` across every replica, batched per node.
+   * Run `build(pipeline, slot, keyPrefix)` across every replica, batched per node. With
+   * `delta`, each node applies it in script calls covering many replicas each,
+   * and `build` is only the fallback.
    * @private
-   * @param {(p: any, slot: number) => void} build
+   * @param {(p: any, slot: number, keyPrefix: string) => void} build
+   * @param {{ remove: string[], add: string[] }} [delta]
    * @returns {Promise<PublishResult>}
    */
-  async _fanout(build) {
+  _fanout(build, delta) {
+    return this._serialize(() => this._fanoutNow(build, delta));
+  }
+
+  /**
+   * Run `fn` once every write queued before it has settled. Writes run one at a
+   * time: a batch's fallback is sent only after its script fails, so it could
+   * otherwise land after, and undo, a later write.
+   * @private
+   * @template T
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  _serialize(fn) {
+    const run = this._lastWrite.then(fn);
+    this._lastWrite = run.catch(() => {});
+    return run;
+  }
+
+  /** @private */
+  async _fanoutNow(build, delta) {
     const t0 = process.hrtime.bigint();
     const groups = this._groupSlotsByNode();
     const { chunkSize } = this.opts;
 
-    /** @type {Promise<{ slots: number[], results: any[] }>[]} */
+    /** @type {Promise<{ slots: number[], results?: any[], error?: Error }>[]} */
     const jobs = [];
     for (const [node, slots] of groups) {
-      for (let i = 0; i < slots.length; i += chunkSize) {
-        const batch = slots.slice(i, i + chunkSize);
-        const target = node || this.cluster;
+      const target = node || this.cluster;
+      // ioredis applies a cluster-level keyPrefix only to commands sent through
+      // the cluster client, so a node's own pipeline needs it added by hand.
+      const pre = node && !node.options.keyPrefix ? this._keyPrefix : '';
+      const viaPipeline = async (batch) => {
         const p = target.pipeline();
-        for (const slot of batch) build(p, slot);
-        jobs.push(p.exec().then((results) => ({ slots: batch, results })));
+        for (const slot of batch) build(p, slot, pre);
+        const results = await p.exec();
+        if (!node || !results) return { slots: batch, results };
+        // A node's own pipeline does not follow redirects, so replay each
+        // redirected slot through the cluster client, which does.
+        const perSlot = results.length / batch.length;
+        await Promise.all(
+          batch.map(async (slot, i) => {
+            const own = results.slice(i * perSlot, (i + 1) * perSlot);
+            if (!own.some(([err]) => err && /^(MOVED|ASK) /.test(err.message))) return;
+            const retry = this.cluster.pipeline();
+            build(retry, slot, '');
+            results.splice(i * perSlot, perSlot, ...(await retry.exec()));
+          })
+        );
+        return { slots: batch, results };
+      };
+      // A script call blocks its node, so bound each call to about chunkSize
+      // member writes rather than chunkSize keys. A call covering a single key
+      // saves nothing over the pipeline, so large deltas skip the script.
+      const keysPerCall = delta
+        ? Math.floor(chunkSize / (delta.remove.length + delta.add.length))
+        : 0;
+      const useScript = Boolean(node && this._useScript && keysPerCall > 1);
+      const size = useScript ? keysPerCall : chunkSize;
+      for (let i = 0; i < slots.length; i += size) {
+        const batch = slots.slice(i, i + size);
+        const run = useScript ? this._viaScript(node, batch, delta, viaPipeline) : viaPipeline(batch);
+        // A batch that throws may have written some slots, but counting them all
+        // as failed only costs a needless reconcile.
+        jobs.push(run.catch((error) => ({ slots: batch, error })));
       }
     }
 
-    const settled = await Promise.allSettled(jobs);
+    const settled = await Promise.all(jobs);
     /** @type {number[]} */
     const failedSlots = [];
     /** @type {Error[]} */
     const causes = [];
 
-    for (const s of settled) {
-      if (s.status === 'rejected') {
-        causes.push(s.reason);
+    for (const { slots, results, error } of settled) {
+      if (error) {
+        failedSlots.push(...slots);
+        causes.push(error);
         continue;
       }
-      const { slots, results } = s.value;
       if (!results) continue;
       // Each slot contributed a fixed number of commands; find which failed.
       const perSlot = results.length / slots.length;
@@ -311,6 +396,27 @@ class IntraSlot {
     };
   }
 
+  /**
+   * Apply `delta` to `batch` in one script call, replaying it through
+   * `viaPipeline` on any error.
+   * @private
+   */
+  async _viaScript(node, batch, delta, viaPipeline) {
+    // ioredis prefixes declared KEYS only, and these are passed as ARGV.
+    const keys = batch.map((slot) => this._keyPrefix + this.keys[slot]);
+    const args = [keys.length, delta.remove.length, delta.add.length];
+    try {
+      await node.eval(DELTA_SCRIPT, 0, ...args, ...keys, ...delta.remove, ...delta.add);
+      return { slots: batch };
+    } catch (err) {
+      if (SCRIPT_REFUSED.test(err.message)) this._useScript = false;
+      // A script aborts on its first error (a migrating slot, a wrong-typed
+      // replica), so replay the batch per slot: the delta is idempotent, and
+      // errors get pinned to their own slots.
+      return viaPipeline(batch);
+    }
+  }
+
   // -- writes --------------------------------------------------------------
 
   /**
@@ -328,13 +434,13 @@ class IntraSlot {
    */
   async publish(members, opts = {}) {
     const list = [...members];
-    const result = await this._fanout((p, slot) => {
-      const key = this.keys[slot];
+    const result = await this._fanout((p, slot, pre) => {
+      const key = pre + this.keys[slot];
       if (list.length === 0) {
         p.del(key);
         return;
       }
-      const staging = `${this.opts.stagingName}:{${TAGS[slot]}}`;
+      const staging = `${pre}${this.opts.stagingName}:{${TAGS[slot]}}`;
       p.del(staging);
       p.sadd(staging, ...list);
       p.rename(staging, key);
@@ -353,9 +459,7 @@ class IntraSlot {
    * @returns {Promise<PublishResult>}
    */
   async add(members) {
-    const list = [...members];
-    if (!list.length) return { replicas: NUM_SLOTS, failed: 0, failedSlots: [], ms: 0 };
-    return this._fanout((p, slot) => p.sadd(this.keys[slot], ...list));
+    return this.applyDelta({ add: members });
   }
 
   /**
@@ -364,9 +468,7 @@ class IntraSlot {
    * @returns {Promise<PublishResult>}
    */
   async remove(members) {
-    const list = [...members];
-    if (!list.length) return { replicas: NUM_SLOTS, failed: 0, failedSlots: [], ms: 0 };
-    return this._fanout((p, slot) => p.srem(this.keys[slot], ...list));
+    return this.applyDelta({ remove: members });
   }
 
   /**
@@ -382,16 +484,16 @@ class IntraSlot {
     if (!toAdd.length && !toRemove.length) {
       return { replicas: NUM_SLOTS, failed: 0, failedSlots: [], ms: 0 };
     }
-    return this._fanout((p, slot) => {
-      const key = this.keys[slot];
+    return this._fanout((p, slot, pre) => {
+      const key = pre + this.keys[slot];
       if (toRemove.length) p.srem(key, ...toRemove);
       if (toAdd.length) p.sadd(key, ...toAdd);
-    });
+    }, { remove: toRemove, add: toAdd });
   }
 
   /** Delete every replica. @returns {Promise<PublishResult>} */
   async clear() {
-    return this._fanout((p, slot) => p.del(this.keys[slot]));
+    return this._fanout((p, slot, pre) => p.del(pre + this.keys[slot]));
   }
 
   // -- operations ----------------------------------------------------------
@@ -437,7 +539,12 @@ class IntraSlot {
    * @param {number[]} [slots] slots to repair; defaults to those verify() flags
    * @returns {Promise<{ repaired: number[] }>}
    */
-  async reconcile(members, slots) {
+  reconcile(members, slots) {
+    return this._serialize(() => this._reconcileNow(members, slots));
+  }
+
+  /** @private */
+  async _reconcileNow(members, slots) {
     let targets = slots;
     if (!targets) {
       const report = await this.verify({ sample: 0 });

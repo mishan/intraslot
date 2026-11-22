@@ -1,12 +1,14 @@
 # Wrong cluster slot for keys containing an empty hash tag
 
 **Affects:** `ioredis` (through 6.0.0) and `node-redis` / `@redis/client`
-(through 6.2.1), via their shared `cluster-key-slot` dependency.
+(through 6.2.1, and the 5.x maintenance line through at least 5.12.4), via
+their shared `cluster-key-slot` dependency.
 
-**Status:** fixed in both clients, on `main` ahead of a release — ioredis
-[#2172](https://github.com/redis/ioredis/pull/2172) (merged 2026-09-01) and
-node-redis [#3431](https://github.com/redis/node-redis/pull/3431) (merged
-2026-08-31). Each vendors the slot function with the patch below and drops the
+**Status:** fixed in both clients. node-redis
+[#3431](https://github.com/redis/node-redis/pull/3431) (merged 2026-08-31)
+shipped in `@redis/client` 6.3.0. ioredis
+[#2172](https://github.com/redis/ioredis/pull/2172) (merged 2026-09-01) is in
+6.1.0-beta.1 but not yet in a stable release. Each vendors the slot function with the patch below and drops the
 `cluster-key-slot` dependency, since it could not be fixed upstream — see [Why
 this had to land in the clients](#why-this-had-to-land-in-the-clients). Releases
 up to the versions above still carry the bug.

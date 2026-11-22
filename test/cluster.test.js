@@ -144,6 +144,167 @@ test('applyDelta orders removals before additions', async () => {
   assert.deepStrictEqual(members.sort(), ['b', 'c']);
 });
 
+async function netInputBytes() {
+  const infos = await Promise.all(cluster.nodes('master').map((n) => n.info('stats')));
+  return infos.reduce((sum, s) => sum + Number(/total_net_input_bytes:(\d+)/.exec(s)[1]), 0);
+}
+
+test('a small delta sends each replica key about once, not a command per replica', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setE' });
+  await fan.publish(['a']);
+
+  const before = await netInputBytes();
+  await fan.applyDelta({ add: ['b'], remove: ['a'] });
+  const sent = (await netInputBytes()) - before;
+
+  assert.deepStrictEqual(await fan.smembers(SUBS), ['b']);
+  // A pipelined SREM + SADD per replica costs ~80 bytes each.
+  assert.ok(sent < 16384 * 30, `sent ${sent} bytes for a +1/-1 delta`);
+});
+
+test('a replica the delta cannot write fails alone, the rest still converge', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setF' });
+  await fan.publish(['a']);
+  const victimSlot = 4242;
+  await cluster.set(fan.keys[victimSlot], 'not a set');
+
+  const result = await fan.applyDelta({ add: ['b'] });
+  assert.deepStrictEqual(result.failedSlots, [victimSlot]);
+
+  await cluster.del(fan.keys[victimSlot]);
+  const report = await fan.verify({ sample: 0 });
+  assert.deepStrictEqual(report.drifted, [victimSlot]);
+  assert.strictEqual(report.majority, 2);
+});
+
+test('concurrent writes apply in the order they were issued', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setH' });
+  await fan.publish(['keep', 'x']);
+  // A wrong-typed replica sends its batch down the slower fallback path.
+  const victimSlot = 4242;
+  await cluster.set(fan.keys[victimSlot], 'not a set');
+
+  await Promise.all([fan.add(['y']), fan.remove(['x', 'y'])]);
+
+  await cluster.del(fan.keys[victimSlot]);
+  const report = await fan.verify({ sample: 0 });
+  assert.deepStrictEqual(report.drifted, [victimSlot]);
+  assert.strictEqual(report.majority, 1);
+});
+
+test('a batch that errors out counts all its slots as failed', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setI' });
+  await fan.publish(['a']);
+  const node = cluster.nodes('master')[0];
+  const addr = `${node.options.host}:${node.options.port}`;
+  const owned = cluster.slots.filter((owners) => owners[0] === addr).length;
+
+  const lost = async () => {
+    throw new Error('Connection is closed.');
+  };
+  const pipeline = node.pipeline;
+  node.eval = lost;
+  node.pipeline = (...args) => Object.assign(pipeline.apply(node, args), { exec: lost });
+  let result;
+  try {
+    result = await fan.applyDelta({ add: ['b'] });
+  } finally {
+    delete node.eval;
+    delete node.pipeline;
+  }
+  assert.strictEqual(result.failed, owned);
+});
+
+async function rejectedEvals(c) {
+  const infos = await Promise.all(c.nodes('master').map((n) => n.info('commandstats')));
+  return infos.reduce((sum, s) => sum + Number((/cmdstat_eval:.*rejected_calls=(\d+)/.exec(s) || [0, 0])[1]), 0);
+}
+
+test('a server that refuses EVAL is not asked again', async () => {
+  const masters = cluster.nodes('master');
+  const acl = (...args) => Promise.all(masters.map((n) => n.call('ACL', ...args)));
+  await acl('SETUSER', 'noeval', 'on', 'nopass', '~*', '&*', '+@all', '-eval');
+  const limited = new Redis.Cluster(NODES, { redisOptions: { username: 'noeval' } });
+  try {
+    await new Promise((resolve, reject) => {
+      limited.once('ready', resolve);
+      limited.once('error', reject);
+    });
+    const fan = new IntraSlot(limited, { name: 'setJ' });
+    await fan.publish(['a']);
+    await fan.add(['b']);
+    const before = await rejectedEvals(limited);
+    assert.ok(before > 0, 'the first write should have tried EVAL');
+
+    await fan.add(['c']);
+    assert.strictEqual(await rejectedEvals(limited), before);
+    assert.deepStrictEqual((await fan.smembers(SUBS)).sort(), ['a', 'b', 'c']);
+  } finally {
+    limited.disconnect();
+    await acl('DELUSER', 'noeval');
+  }
+});
+
+/** Migrate every key in `slot` from master `src` to `dst`; resolves to a function that hands over the slot. */
+async function startSlotMove(slot, src, dst) {
+  const masters = cluster.nodes('master');
+  const ids = await Promise.all(masters.map((n) => n.cluster('MYID')));
+  await masters[dst].cluster('SETSLOT', slot, 'IMPORTING', ids[src]);
+  await masters[src].cluster('SETSLOT', slot, 'MIGRATING', ids[dst]);
+  const keys = await masters[src].cluster('GETKEYSINSLOT', slot, 1000);
+  if (keys.length) {
+    await masters[src].migrate('127.0.0.1', masters[dst].options.port, '', 0, 5000, 'KEYS', ...keys);
+  }
+  return () => Promise.all(masters.map((n) => n.cluster('SETSLOT', slot, 'NODE', ids[dst])));
+}
+
+test('writes reach a replica whose slot is migrating, then moved', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setG' });
+  await fan.publish(['a']);
+  const slot = 100;
+  const key = fan.keys[slot];
+  const masters = cluster.nodes('master');
+  const src = masters.findIndex((n) => cluster.slots[slot][0] === `${n.options.host}:${n.options.port}`);
+  const dst = (src + 1) % masters.length;
+
+  let finish;
+  try {
+    finish = await startSlotMove(slot, src, dst);
+    const asked = await fan.applyDelta({ add: ['b'] });
+    assert.deepStrictEqual(asked.failedSlots, [], 'ASK');
+    assert.deepStrictEqual((await cluster.smembers(key)).sort(), ['a', 'b']);
+
+    await finish();
+    const moved = await fan.applyDelta({ add: ['c'] });
+    assert.deepStrictEqual(moved.failedSlots, [], 'MOVED');
+    assert.deepStrictEqual((await cluster.smembers(key)).sort(), ['a', 'b', 'c']);
+  } finally {
+    if (finish) {
+      await finish();
+      await (await startSlotMove(slot, dst, src))();
+    } else {
+      await Promise.all(masters.map((n) => n.cluster('SETSLOT', slot, 'STABLE')));
+    }
+    await new Promise((resolve) => cluster.refreshSlotsCache(resolve));
+  }
+});
+
+test('reconcile waits for writes already in flight', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setL' });
+  await fan.publish(['a']);
+  // A wrong-typed replica sends its batch, neighbor included, down the slower
+  // fallback path, which would land after an unqueued reconcile.
+  const victimSlot = 4242;
+  const neighbor = 4243;
+  await cluster.set(fan.keys[victimSlot], 'not a set');
+
+  const delta = fan.applyDelta({ add: ['b'] });
+  await fan.reconcile(['a'], [neighbor]);
+  await delta;
+  await cluster.del(fan.keys[victimSlot]);
+  assert.deepStrictEqual(await cluster.smembers(fan.keys[neighbor]), ['a']);
+});
+
 test('verify detects a drifted replica and reconcile repairs it', async () => {
   const fan = new IntraSlot(cluster, { name: 'set9' });
   await fan.publish(['a', 'b', 'c']);
@@ -225,6 +386,33 @@ test('Redis-named aliases match their plain-English primaries', async () => {
     await fan.intersectInto(`b:{${USER}}`, SUBS)
   );
 });
+
+for (const [label, opts] of [
+  ['cluster keyPrefix', { keyPrefix: 'pfx:' }],
+  ['node keyPrefix', { redisOptions: { keyPrefix: 'pfx:' } }],
+]) {
+  test(`writes honor ${label}`, async () => {
+    const prefixed = new Redis.Cluster(NODES, opts);
+    try {
+      await new Promise((resolve, reject) => {
+        prefixed.once('ready', resolve);
+        prefixed.once('error', reject);
+      });
+      // chunkSize 64 sends deltas of more than 32 members down the pipeline.
+      const fan = new IntraSlot(prefixed, { name: 'setK', chunkSize: 64 });
+      await fan.publish(['a']);
+      await fan.applyDelta({ add: ['b'] });
+      const many = Array.from({ length: 40 }, (_, i) => `m${i}`);
+      await fan.add(many);
+      await fan.remove(many);
+      assert.deepStrictEqual((await fan.smembers(SUBS)).sort(), ['a', 'b']);
+      assert.ok((await fan.verify({ sample: 0 })).consistent);
+      assert.strictEqual(await cluster.exists(fan.keyFor(SUBS)), 0, 'no unprefixed replica');
+    } finally {
+      await prefixed.quit();
+    }
+  });
+}
 
 test('constructor requires a name', () => {
   assert.throws(() => new IntraSlot(cluster, {}), /options\.name is required/);
