@@ -154,11 +154,11 @@ class IntraSlot {
     /** All 16384 replica keys, precomputed once. @type {string[]} */
     this.keys = TAGS.map((t) => `${this.name}:{${t}}`);
 
-    /** The prefix ioredis adds to keys sent through the cluster client. @private */
+    /** The prefix ioredis adds to keys sent through the cluster client. @type {string} */
     this._keyPrefix = cluster.options?.keyPrefix || '';
-    /** Tail of the write queue. @private */
+    /** Tail of the write queue. @type {Promise<unknown>} */
     this._lastWrite = Promise.resolve();
-    /** Cleared once a server shows it cannot run WRITE_SCRIPT. @private */
+    /** Cleared once a server shows it cannot run WRITE_SCRIPT. @type {boolean} */
     this._useScript = true;
   }
 
@@ -656,4 +656,7 @@ class IntraSlot {
   }
 }
 
-module.exports = { IntraSlot, slotRanges };
+// Assigned one by one: tsc cannot emit declarations for a module.exports object
+// holding a class with private members.
+exports.IntraSlot = IntraSlot;
+exports.slotRanges = slotRanges;

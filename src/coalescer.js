@@ -189,4 +189,5 @@ class Coalescer extends EventEmitter {
   }
 }
 
-module.exports = { Coalescer };
+// Assigned rather than module.exports = {...}: see the note in intraslot.js.
+exports.Coalescer = Coalescer;
