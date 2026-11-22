@@ -24,7 +24,7 @@
     "url": "https://github.com/mishan/intraslot/issues"
   },
   "scripts": {
-    "test": "node --test test/slot.test.js",
+    "test": "node --test test/slot.test.js test/coalescer.test.js",
     "test:cluster": "bash scripts/with-cluster.sh node --test test/cluster.test.js",
     "bench": "bash scripts/with-cluster.sh node test/bench.js",
     "gen-table": "node scripts/gen-slot-table.js",

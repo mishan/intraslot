@@ -1,6 +1,7 @@
 'use strict';
 /** @module intraslot */
 
+const crypto = require('crypto');
 const { NUM_SLOTS, slotFor } = require('./slot');
 const { TAGS, verifyTable } = require('./table');
 const { CrossSlotError, PartialPublishError } = require('./errors');
@@ -17,7 +18,9 @@ const { CrossSlotError, PartialPublishError } = require('./errors');
  *   set's identity -- it is the second operand of every operation below.
  * @property {string} [stagingName] name for staging keys used by atomic publish
  * @property {boolean} [verify]    verify the shipped slot table on construction (default true)
- * @property {number} [chunkSize]  max keys per pipeline (default 2048)
+ * @property {number} [chunkSize]  max keys per pipeline or script call (default 2048)
+ * @property {number} [scriptBudget] max member writes per script call, which
+ *   bounds how long one call blocks a node (default 32768, a few ms)
  */
 
 /**
@@ -28,7 +31,90 @@ const { CrossSlotError, PartialPublishError } = require('./errors');
  * @property {number[]} failedSlots
  */
 
-const DEFAULTS = { stagingName: 'intraslot:staging', verify: true, chunkSize: 2048 };
+const DEFAULTS = {
+  stagingName: 'intraslot:staging',
+  verify: true,
+  chunkSize: 2048,
+  scriptBudget: 32768,
+};
+
+// Errors meaning this server will never run WRITE_SCRIPT for us.
+const SCRIPT_REFUSED =
+  /^(NOPERM|ERR unknown command|ERR Error compiling script|ERR Unexpected flag|ERR ACL failure in script)/;
+
+// The slot table, packed so the script can name any replica itself: tags are at
+// most TAG_WIDTH digits, space-padded, and TAG_LENGTHS holds each one's length.
+const TAG_WIDTH = 6;
+const PACKED_TAGS = TAGS.map((t) => t.padEnd(TAG_WIDTH)).join('');
+const TAG_LENGTHS = TAGS.map((t) => t.length).join('');
+
+// Writes the replicas in some slot ranges on one node, building their names
+// from the embedded table, so neither key names nor a command per replica cross
+// the wire. Each replica is replaced (UNLINK, then SADD) or changed by a delta
+// (SREM, then SADD); a script runs atomically, so readers never see a replica
+// half-replaced. UNLINK rather than DEL so a large old set is freed in the
+// background instead of inside the call, which scriptBudget does not count. No keys are declared because allow-cross-slot-keys still
+// rejects declared KEYS from different slots, and the same rule keeps COPY from
+// cloning one replica into another.
+// unpack() is chunked to stay under Lua's C stack limit (~8000 values).
+// ARGV: key prefix + name, replace (1/0), nranges, nremove, nadd,
+//       (first slot, last slot) x nranges, removals..., additions...
+const WRITE_SCRIPT = `#!lua flags=allow-cross-slot-keys
+local TAGS, LENGTHS = "${PACKED_TAGS}", "${TAG_LENGTHS}"
+local head, replace = ARGV[1] .. ':{', ARGV[2] == '1'
+local ng, nr, na = tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
+local base = 6 + 2 * ng
+local function apply(cmd, key, from, n)
+  for i = from, from + n - 1, 4096 do
+    redis.call(cmd, key, unpack(ARGV, i, math.min(i + 4095, from + n - 1)))
+  end
+end
+for g = 0, ng - 1 do
+  for slot = tonumber(ARGV[6 + 2 * g]), tonumber(ARGV[7 + 2 * g]) do
+    local at = slot * ${TAG_WIDTH} + 1
+    local len = string.byte(LENGTHS, slot + 1) - 48
+    local key = head .. string.sub(TAGS, at, at + len - 1) .. '}'
+    if replace then redis.call('UNLINK', key) end
+    apply('SREM', key, base, nr)
+    apply('SADD', key, base + nr, na)
+  end
+end
+return 1`;
+const WRITE_SHA = crypto.createHash('sha1').update(WRITE_SCRIPT).digest('hex');
+
+/** In-flight SCRIPT LOADs, by server address. @type {Map<string, Promise<string>>} */
+const loading = new Map();
+
+/**
+ * SCRIPT LOAD the write script on `node`, sharing one load among every call
+ * that found it missing, from any instance, rather than resending the ~115 KB
+ * body with each.
+ * @param {Redis} node
+ * @returns {Promise<string>}
+ */
+function loadScript(node) {
+  const addr = `${node.options.host}:${node.options.port}`;
+  let load = loading.get(addr);
+  if (!load) {
+    load = node.script('LOAD', WRITE_SCRIPT).finally(() => loading.delete(addr));
+    loading.set(addr, load);
+  }
+  return load;
+}
+
+/**
+ * Collapse ascending slot numbers into [first, last] runs.
+ * @param {number[]} slots
+ * @returns {number[]} first0, last0, first1, last1, ...
+ */
+function slotRanges(slots) {
+  const out = [];
+  for (const slot of slots) {
+    if (out.length && out[out.length - 1] === slot - 1) out[out.length - 1] = slot;
+    else out.push(slot, slot);
+  }
+  return out;
+}
 
 /**
  * A set replicated to all 16384 slots, so it can be intersected server-side
@@ -60,11 +146,20 @@ class IntraSlot {
     this.cluster = cluster;
     /** Name of this replicated set; also the key prefix. @type {string} */
     this.name = options.name;
-    this.opts = { ...DEFAULTS, ...options };
+    // An option passed as undefined, say from an unset config value, means the default.
+    const given = Object.entries(options).filter(([, v]) => v !== undefined);
+    this.opts = { ...DEFAULTS, ...Object.fromEntries(given) };
     if (this.opts.verify) verifyTable();
 
     /** All 16384 replica keys, precomputed once. @type {string[]} */
     this.keys = TAGS.map((t) => `${this.name}:{${t}}`);
+
+    /** The prefix ioredis adds to keys sent through the cluster client. @private */
+    this._keyPrefix = cluster.options?.keyPrefix || '';
+    /** Tail of the write queue. @private */
+    this._lastWrite = Promise.resolve();
+    /** Cleared once a server shows it cannot run WRITE_SCRIPT. @private */
+    this._useScript = true;
   }
 
   // -- addressing ----------------------------------------------------------
@@ -228,8 +323,10 @@ class IntraSlot {
   /**
    * Group all 16384 replica keys by the node that currently owns them.
    *
-   * A stale grouping is harmless: misrouted writes get a MOVED and ioredis
-   * retries. This exists purely so writes can be pipelined.
+   * A stale grouping is harmless: a write that gets MOVED or ASK is replayed
+   * through the cluster client. (A publish to a slot mid-migration can still
+   * fail, on TRYAGAIN, and is reported in `failedSlots`.) This exists purely so
+   * writes can be pipelined.
    *
    * @private
    * @returns {Map<Redis, number[]>} node -> slot numbers
@@ -256,40 +353,93 @@ class IntraSlot {
   }
 
   /**
-   * Run `build(pipeline, slot)` across every replica, batched per node.
+   * Run `build(pipeline, slot, keyPrefix)` across every replica, batched per
+   * node. With `write`, each node applies it in script calls covering many
+   * replicas each, and `build` is only the fallback.
    * @private
-   * @param {(p: any, slot: number) => void} build
+   * @param {(p: any, slot: number, keyPrefix: string) => void} build
+   * @param {{ replace?: boolean, remove: string[], add: string[] }} [write]
    * @returns {Promise<PublishResult>}
    */
-  async _fanout(build) {
+  _fanout(build, write) {
+    return this._serialize(() => this._fanoutNow(build, write));
+  }
+
+  /**
+   * Run `fn` once every write queued before it has settled. Writes run one at a
+   * time: a batch's fallback is sent only after its script fails, so it could
+   * otherwise land after, and undo, a later write.
+   * @private
+   * @template T
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  _serialize(fn) {
+    const run = this._lastWrite.then(fn);
+    this._lastWrite = run.catch(() => {});
+    return run;
+  }
+
+  /** @private */
+  async _fanoutNow(build, write) {
     const t0 = process.hrtime.bigint();
     const groups = this._groupSlotsByNode();
-    const { chunkSize } = this.opts;
+    const { chunkSize, scriptBudget } = this.opts;
 
-    /** @type {Promise<{ slots: number[], results: any[] }>[]} */
+    /** @type {Promise<{ slots: number[], results?: any[], error?: Error }>[]} */
     const jobs = [];
     for (const [node, slots] of groups) {
-      for (let i = 0; i < slots.length; i += chunkSize) {
-        const batch = slots.slice(i, i + chunkSize);
-        const target = node || this.cluster;
+      const target = node || this.cluster;
+      // ioredis applies a cluster-level keyPrefix only to commands sent through
+      // the cluster client, so a node's own pipeline needs it added by hand.
+      const pre = node && !node.options.keyPrefix ? this._keyPrefix : '';
+      const viaPipeline = async (batch) => {
         const p = target.pipeline();
-        for (const slot of batch) build(p, slot);
-        jobs.push(p.exec().then((results) => ({ slots: batch, results })));
+        for (const slot of batch) build(p, slot, pre);
+        const results = await p.exec();
+        if (!node || !results) return { slots: batch, results };
+        // A node's own pipeline does not follow redirects, so replay each
+        // redirected slot through the cluster client, which does.
+        const perSlot = results.length / batch.length;
+        await Promise.all(
+          batch.map(async (slot, i) => {
+            const own = results.slice(i * perSlot, (i + 1) * perSlot);
+            if (!own.some(([err]) => err && /^(MOVED|ASK) /.test(err.message))) return;
+            const retry = this.cluster.pipeline();
+            build(retry, slot, '');
+            results.splice(i * perSlot, perSlot, ...(await retry.exec()));
+          })
+        );
+        return { slots: batch, results };
+      };
+      // A script call blocks its node, so bound each call to scriptBudget member
+      // writes. A call covering a single key saves nothing over the pipeline,
+      // so very large writes skip the script.
+      const membersPerKey = write ? Math.max(1, write.remove.length + write.add.length) : 0;
+      const keysPerCall = write ? Math.min(chunkSize, Math.floor(scriptBudget / membersPerKey)) : 0;
+      const useScript = Boolean(node && this._useScript && keysPerCall > 1);
+      const size = useScript ? keysPerCall : chunkSize;
+      for (let i = 0; i < slots.length; i += size) {
+        const batch = slots.slice(i, i + size);
+        const run = useScript ? this._viaScript(node, batch, write, viaPipeline) : viaPipeline(batch);
+        // A batch that throws may have written some slots, but counting them all
+        // as failed only costs a needless reconcile.
+        jobs.push(run.catch((error) => ({ slots: batch, error })));
       }
     }
 
-    const settled = await Promise.allSettled(jobs);
+    const settled = await Promise.all(jobs);
     /** @type {number[]} */
     const failedSlots = [];
     /** @type {Error[]} */
     const causes = [];
 
-    for (const s of settled) {
-      if (s.status === 'rejected') {
-        causes.push(s.reason);
+    for (const { slots, results, error } of settled) {
+      if (error) {
+        failedSlots.push(...slots);
+        causes.push(error);
         continue;
       }
-      const { slots, results } = s.value;
       if (!results) continue;
       // Each slot contributed a fixed number of commands; find which failed.
       const perSlot = results.length / slots.length;
@@ -311,14 +461,43 @@ class IntraSlot {
     };
   }
 
+  /**
+   * Apply `write` to `batch` in one script call, replaying it through
+   * `viaPipeline` on any error.
+   * @private
+   */
+  async _viaScript(node, batch, write, viaPipeline) {
+    const ranges = slotRanges(batch);
+    // ioredis prefixes declared KEYS only, and the script builds its own.
+    const args = [
+      this._keyPrefix + this.name, write.replace ? 1 : 0, ranges.length / 2,
+      write.remove.length, write.add.length, ...ranges, ...write.remove, ...write.add,
+    ];
+    try {
+      await node.evalsha(WRITE_SHA, 0, ...args).catch(async (err) => {
+        if (!/^NOSCRIPT/.test(err.message)) throw err;
+        await loadScript(node);
+        return node.evalsha(WRITE_SHA, 0, ...args);
+      });
+      return { slots: batch };
+    } catch (err) {
+      if (SCRIPT_REFUSED.test(err.message)) this._useScript = false;
+      // A script aborts on its first error (a migrating slot, a wrong-typed
+      // replica), so replay the batch per slot: the delta is idempotent, and
+      // errors get pinned to their own slots.
+      return viaPipeline(batch);
+    }
+  }
+
   // -- writes --------------------------------------------------------------
 
   /**
    * Replace the replicated set everywhere.
    *
-   * Each replica is swapped atomically: members are staged under a co-slotted
-   * staging key, then RENAMEd over the live key. Readers see either the old set
-   * or the new one, never a half-built one. The fanout as a whole is still
+   * Each replica is swapped atomically, inside a script call or, on the
+   * per-replica fallback, by staging the members under a co-slotted key and
+   * RENAMEing it over the live one. Readers see either the old set or the new
+   * one, never a half-built one. The fanout as a whole is still
    * eventually consistent -- there is no cross-slot transaction, and there
    * cannot be -- so different nodes may briefly disagree.
    *
@@ -328,17 +507,17 @@ class IntraSlot {
    */
   async publish(members, opts = {}) {
     const list = [...members];
-    const result = await this._fanout((p, slot) => {
-      const key = this.keys[slot];
+    const result = await this._fanout((p, slot, pre) => {
+      const key = pre + this.keys[slot];
       if (list.length === 0) {
         p.del(key);
         return;
       }
-      const staging = `${this.opts.stagingName}:{${TAGS[slot]}}`;
+      const staging = `${pre}${this.opts.stagingName}:{${TAGS[slot]}}`;
       p.del(staging);
       p.sadd(staging, ...list);
       p.rename(staging, key);
-    });
+    }, { replace: true, remove: [], add: list });
     if (result.failed && opts.throwOnPartial !== false) {
       throw new PartialPublishError(result.failed, NUM_SLOTS, [
         new Error(`slots ${result.failedSlots.slice(0, 5).join(', ')} ...`),
@@ -353,9 +532,7 @@ class IntraSlot {
    * @returns {Promise<PublishResult>}
    */
   async add(members) {
-    const list = [...members];
-    if (!list.length) return { replicas: NUM_SLOTS, failed: 0, failedSlots: [], ms: 0 };
-    return this._fanout((p, slot) => p.sadd(this.keys[slot], ...list));
+    return this.applyDelta({ add: members });
   }
 
   /**
@@ -364,9 +541,7 @@ class IntraSlot {
    * @returns {Promise<PublishResult>}
    */
   async remove(members) {
-    const list = [...members];
-    if (!list.length) return { replicas: NUM_SLOTS, failed: 0, failedSlots: [], ms: 0 };
-    return this._fanout((p, slot) => p.srem(this.keys[slot], ...list));
+    return this.applyDelta({ remove: members });
   }
 
   /**
@@ -382,16 +557,20 @@ class IntraSlot {
     if (!toAdd.length && !toRemove.length) {
       return { replicas: NUM_SLOTS, failed: 0, failedSlots: [], ms: 0 };
     }
-    return this._fanout((p, slot) => {
-      const key = this.keys[slot];
+    return this._fanout((p, slot, pre) => {
+      const key = pre + this.keys[slot];
       if (toRemove.length) p.srem(key, ...toRemove);
       if (toAdd.length) p.sadd(key, ...toAdd);
-    });
+    }, { remove: toRemove, add: toAdd });
   }
 
   /** Delete every replica. @returns {Promise<PublishResult>} */
   async clear() {
-    return this._fanout((p, slot) => p.del(this.keys[slot]));
+    return this._fanout((p, slot, pre) => p.del(pre + this.keys[slot]), {
+      replace: true,
+      remove: [],
+      add: [],
+    });
   }
 
   // -- operations ----------------------------------------------------------
@@ -437,7 +616,12 @@ class IntraSlot {
    * @param {number[]} [slots] slots to repair; defaults to those verify() flags
    * @returns {Promise<{ repaired: number[] }>}
    */
-  async reconcile(members, slots) {
+  reconcile(members, slots) {
+    return this._serialize(() => this._reconcileNow(members, slots));
+  }
+
+  /** @private */
+  async _reconcileNow(members, slots) {
     let targets = slots;
     if (!targets) {
       const report = await this.verify({ sample: 0 });
@@ -472,4 +656,4 @@ class IntraSlot {
   }
 }
 
-module.exports = { IntraSlot };
+module.exports = { IntraSlot, slotRanges };

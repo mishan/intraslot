@@ -128,8 +128,8 @@ receiver still supplies the second key.
 ### High-churn sets
 
 Presence data changes constantly, and fanning out per event costs
-`events/sec × 16384` commands. Don't. Buffer into ticks — a tick costs
-`2 × 16384` commands regardless of how many events it absorbed, so write cost
+`events/sec × 16384` replica writes. Don't. Buffer into ticks — a tick costs
+`2 × 16384` replica writes regardless of how many events it absorbed, so write cost
 becomes a function of tick rate rather than churn rate:
 
 ```js
@@ -144,23 +144,54 @@ await c.close();   // stops ticking, flushes what's buffered
 
 | churn | per-event fanout | coalesced @ 250 ms |
 |---|---|---|
-| 50 events/s | 819,200 cmd/s | 131,072 cmd/s |
-| 1000 events/s | 16,384,000 cmd/s | 131,072 cmd/s |
+| 50 events/s | 819,200 writes/s | 131,072 writes/s |
+| 1000 events/s | 16,384,000 writes/s | 131,072 writes/s |
 
 Measured by `npm run bench` on a 3-node cluster sharing one sandbox CPU — a
 pessimistic floor:
 
 ```
-initial publish (200 members -> 16384 replicas): 1065 ms (15,383 keys/s)
-coalesced delta tick (+6/-4)                   :   70 ms (~470,000 cmds/s)
-sustainable tick rate                          : ~14 Hz
+initial publish (200 members -> 16384 replicas):  138 ms (~119,000 keys/s)
+coalesced delta tick (+6/-4)                   :   23 ms (~1,450,000 replica writes/s)
+sustainable tick rate                          : ~44 Hz
 verify across 256 sampled replicas             : CONSISTENT
 ```
 
-So a 250 ms tick has roughly 3.5x headroom. Ticks never overlap, and a member
-added and removed within one tick resolves to the last write. The cost is
-staleness bounded by one tick — fine for presence, wrong wherever a stale read
-is *incorrect* rather than merely dated.
+So a 250 ms tick has roughly 10x headroom. Writes go through a Lua script
+(`allow-cross-slot-keys`, Redis 7+) that embeds the slot table, so each call
+names a range of slots and the script builds the replica keys itself. The
+members cross the wire once per call, and neither key names nor a command per
+replica do: the +6/-4 tick above sends about 2 KB, where per-replica commands
+send about 300 KB, and a 200-member publish sends about 0.3 MB instead of 42 MB.
+That is most of why publish is about 7x faster than per-replica commands. The
+saving is between the client and the masters only: Redis replicates the
+commands a script runs, not the call, so replicas and the AOF still receive one
+write per replica.
+
+Each call writes at most `scriptBudget` members (default 32768, a few ms of
+blocking per call), across at most `chunkSize` replicas. The ~115 KB script is
+loaded once per node and called by its SHA after that. A call that fails is
+replayed as plain per-replica commands. Writes of more than `scriptBudget / 2`
+members, and servers that refuse the script, use the plain commands throughout.
+
+Ticks never overlap, and a member added and removed within one tick resolves to
+the last write. The cost is staleness bounded by one tick — fine for presence,
+wrong wherever a stale read is *incorrect* rather than merely dated. Only busy
+sets pay it: a change that arrives when no flush has started for a tick is
+applied at once, so a rarely changing set sees its writes land in about one
+fanout's time (~20 ms above) rather than up to `tickMs`.
+
+### One writer per set
+
+An `IntraSlot` instance applies its writes one at a time, in the order they were
+called. Two instances writing the same set get no such ordering and can undo
+each other's changes, so give each set a single writer: one instance in one
+process, ideally behind a coalescer. Different sets are independent and can be
+spread across processes.
+
+Because writes queue, one stuck on an unresponsive node holds up the ones behind
+it. Set ioredis's `commandTimeout` so it fails instead, and prefer the coalescer
+to per-event `add()` calls so the queue cannot grow without bound.
 
 ### Operations
 
@@ -194,16 +225,17 @@ slot.
 | `slotOf(key)` | — | slot number, per Redis's own rule |
 | `assertSameSlot(keys)` | — | throws `CrossSlotError` with an explanation |
 | `smembers` / `sismember` / `scard` | | read the replica local to a key |
-| `publish(members)` | replace everywhere; atomic per replica via staged `RENAME` |
+| `publish(members)` | replace everywhere; atomic per replica |
 | `add` / `remove` / `applyDelta` | incremental fanout |
 | `clear()` | delete every replica |
 | `verify({sample})` | drift report |
 | `reconcile(members, [slots])` | repair drifted replicas |
 | `coalescer(opts)` | tick-based publisher for high churn |
 
-`publish()` stages members under a co-slotted staging key and `RENAME`s it over
-the live key, so a reader sees either the old set or the new one — never a
-half-built one. The fanout as a whole is still eventually consistent; there is no
+`publish()` replaces each replica inside a script call, or on the per-replica
+fallback stages the members under a co-slotted key and `RENAME`s it over the live
+one, so a reader sees either the old set or the new one — never a half-built
+one. The fanout as a whole is still eventually consistent; there is no
 cross-slot transaction spanning 16384 slots, and there cannot be.
 
 ## Cost
@@ -250,9 +282,9 @@ Redis treats `{}` as *no tag* and hashes the whole key, stopping the search.
 Checked against a live server's `CLUSTER KEYSLOT` over 8016 keys:
 `cluster-key-slot@1.1.2` disagreed with Redis 460 times; this package, 0.
 
-Both major Node clients depend on it — ioredis pins `1.1.1` exactly, node-redis's
+Both major Node clients have depended on it — ioredis pins `1.1.1` exactly, node-redis's
 `@redis/client` uses `1.1.2` — and the two files are byte-identical, so the bug
-is live in both. In ioredis it also reaches `generateMulti()`, which gates every
+has been live in both. In ioredis it also reaches `generateMulti()`, which gates every
 command in a pipeline and misjudges in both directions: allowing commands the
 server then rejects with `CROSSSLOT`, and refusing ones it would have accepted.
 
@@ -261,8 +293,10 @@ was archived read-only on Mar 17, 2026, and ioredis's exact pin means an upstrea
 release wouldn't reach anyone anyway — so it was fixed in the clients instead:
 both now vendor the slot function with the patch applied
 (ioredis [#2172](https://github.com/redis/ioredis/pull/2172), node-redis
-[#3431](https://github.com/redis/node-redis/pull/3431), merged on `main` and
-ahead of a release as of this writing). A full write-up, per-client call sites,
+[#3431](https://github.com/redis/node-redis/pull/3431)). The node-redis fix
+shipped in `@redis/client` 6.3.0; the 5.x maintenance line still has the bug.
+The ioredis fix is in 6.1.0-beta.1, and the latest stable release, 6.0.0, still
+has the bug as of this writing. A full write-up, per-client call sites,
 the patch and reproducible validation are in
 [`contrib/empty-hashtag-slot-bug/`](contrib/empty-hashtag-slot-bug/).
 

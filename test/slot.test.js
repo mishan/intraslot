@@ -179,3 +179,16 @@ test('table is the minimal table: no smaller tag exists for any slot', () => {
     assert.strictEqual(TAGS[s], firstSeen.get(s), `slot ${s} is not minimal`);
   }
 });
+
+test('slotRanges collapses ascending slots into first/last runs', () => {
+  const { slotRanges } = require('../src/intraslot');
+  for (const [slots, expected] of [
+    [[], []],
+    [[7], [7, 7]],
+    [[0, 1, 2, 3], [0, 3]],
+    [[1, 2, 4, 5, 9], [1, 2, 4, 5, 9, 9]],
+    [[100, 5461, 5462], [100, 100, 5461, 5462]],
+  ]) {
+    assert.deepStrictEqual(slotRanges(slots), expected, JSON.stringify(slots));
+  }
+});

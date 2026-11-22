@@ -44,7 +44,7 @@ const ms = (t0) => Number(process.hrtime.bigint() - t0) / 1e6;
     lat.push(dt);
     console.log(`  tick ${tick}: +${added.length}/-${removed.length} over ${NUM_SLOTS} ` +
                 `replicas -> ${dt.toFixed(0)} ms ` +
-                `(${(NUM_SLOTS * 2 / dt * 1000).toFixed(0)} cmds/s)`);
+                `(${(NUM_SLOTS * 2 / dt * 1000).toFixed(0)} replica writes/s)`);
   }
   const avg = lat.reduce((a, b) => a + b) / lat.length;
   const hz = 1000 / avg;
@@ -59,11 +59,11 @@ const ms = (t0) => Number(process.hrtime.bigint() - t0) / 1e6;
   const coalesced = Math.round((NUM_SLOTS * 2) / avg * 1000);
   console.log('\n' + '='.repeat(74));
   console.log('cost for a presence set churning at R events/sec:');
-  console.log(`  per-event : R x ${NUM_SLOTS} cmd/s      -- scales with churn`);
-  console.log(`  coalesced : ${coalesced.toLocaleString()} cmd/s  -- INDEPENDENT of churn`);
+  console.log(`  per-event : R x ${NUM_SLOTS} writes/s      -- scales with churn`);
+  console.log(`  coalesced : ${coalesced.toLocaleString()} writes/s  -- INDEPENDENT of churn`);
   for (const r of [10, 50, 200, 1000]) {
-    console.log(`    R=${String(r).padEnd(5)} -> per-event ${(r * NUM_SLOTS).toLocaleString().padStart(12)} cmd/s ` +
-                `| coalesced ${coalesced.toLocaleString().padStart(9)} cmd/s`);
+    console.log(`    R=${String(r).padEnd(5)} -> per-event ${(r * NUM_SLOTS).toLocaleString().padStart(12)} writes/s ` +
+                `| coalesced ${coalesced.toLocaleString().padStart(9)} writes/s`);
   }
   console.log('='.repeat(74));
 

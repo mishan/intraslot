@@ -2,26 +2,33 @@
 /** @module intraslot/coalescer */
 
 const { EventEmitter } = require('events');
+const { performance } = require('perf_hooks');
 
 /**
  * @typedef {object} CoalescerOptions
- * @property {number} [tickMs]   how long to buffer before flushing (default 250)
+ * @property {number} [tickMs]   minimum time between the starts of two flushes (default 250)
  * @property {number} [maxBuffer] flush early once this many pending changes accumulate (default Infinity)
  * @property {(err: Error) => void} [onError] called on flush failure; otherwise emitted as 'error'
  */
 
 /**
- * Buffers membership changes and applies them once per tick.
+ * Buffers membership changes and applies them at most once per tick.
  *
- * Fanning out per event costs `events/sec x 16384` commands and is hopeless past
- * a trickle. A tick costs `2 x 16384` commands no matter how many events it
- * absorbed, so the write cost becomes a function of tick rate rather than churn
- * rate. The price is staleness bounded by one tick -- fine for presence data,
- * wrong wherever a stale read is incorrect rather than merely dated.
+ * Fanning out per event costs `events/sec x 16384` replica writes and is
+ * hopeless past a trickle. A tick costs `2 x 16384` replica writes no matter how
+ * many events it absorbed, so the write cost becomes a function of tick rate
+ * rather than churn rate. The price is staleness bounded by one tick -- fine for
+ * presence data, wrong wherever a stale read is incorrect rather than merely
+ * dated.
  *
- * Ticks never overlap: if a flush is still running when the timer fires, the
- * next flush is deferred rather than issued concurrently, since two overlapping
- * deltas can land out of order.
+ * A change that arrives when no flush has started for a tick is applied at once,
+ * on the next turn of the event loop so that a synchronous burst still lands in
+ * one flush. Changes arriving sooner wait until a tick after the last flush
+ * started, so rare changes land in milliseconds and heavy churn still costs one
+ * fanout per tick.
+ *
+ * Flushes never overlap: changes queued while one runs wait for it to finish,
+ * since two overlapping deltas can land out of order.
  *
  * @example
  * const c = fan.coalescer({ tickMs: 250 });
@@ -52,9 +59,13 @@ class Coalescer extends EventEmitter {
     this._remove = new Set();
     this._flushing = false;
     this._closed = false;
+    /**
+     * When the last flush started, or failed, on the monotonic clock: a
+     * wall-clock step must not stretch or skip a tick.
+     */
+    this._lastStart = -Infinity;
     /** @type {NodeJS.Timeout|null} */
-    this._timer = setInterval(() => this._maybeFlush(), this.tickMs);
-    if (this._timer.unref) this._timer.unref();
+    this._timer = null;
   }
 
   /** Pending change count. @returns {number} */
@@ -73,6 +84,7 @@ class Coalescer extends EventEmitter {
       this._add.add(m);
     }
     if (this.pending >= this.maxBuffer) this._maybeFlush();
+    else this._schedule();
   }
 
   /**
@@ -85,6 +97,21 @@ class Coalescer extends EventEmitter {
       this._remove.add(m);
     }
     if (this.pending >= this.maxBuffer) this._maybeFlush();
+    else this._schedule();
+  }
+
+  /**
+   * Arm the timer for the next flush, a tick after the last one started.
+   * @private
+   */
+  _schedule() {
+    if (this._timer || this._closed || this.pending === 0) return;
+    const wait = Math.max(0, this._lastStart + this.tickMs - performance.now());
+    this._timer = setTimeout(() => {
+      this._timer = null;
+      this._maybeFlush();
+    }, wait);
+    if (this._timer.unref) this._timer.unref();
   }
 
   /** @private */
@@ -111,6 +138,10 @@ class Coalescer extends EventEmitter {
     this._add = new Set();
     this._remove = new Set();
     this._flushing = true;
+    this._lastStart = performance.now();
+    // A timer armed for the previous tick would fire too soon after this flush.
+    if (this._timer) clearTimeout(this._timer);
+    this._timer = null;
 
     this._inflight = (async () => {
       try {
@@ -127,6 +158,8 @@ class Coalescer extends EventEmitter {
         });
         return result;
       } catch (err) {
+        // Wait a full tick before retrying, however long this attempt took.
+        this._lastStart = performance.now();
         // Put the delta back so the next tick retries it, without clobbering
         // changes queued while this flush was in flight.
         for (const m of add) if (!this._remove.has(m)) this._add.add(m);
@@ -134,6 +167,8 @@ class Coalescer extends EventEmitter {
         throw err;
       } finally {
         this._flushing = false;
+        // Changes queued meanwhile, or a failed delta put back, go next tick.
+        this._schedule();
       }
     })();
 
@@ -147,7 +182,7 @@ class Coalescer extends EventEmitter {
   async close() {
     if (this._closed) return;
     this._closed = true;
-    if (this._timer) clearInterval(this._timer);
+    if (this._timer) clearTimeout(this._timer);
     this._timer = null;
     if (this._flushing) await this._inflight.catch(() => {});
     if (this.pending) await this.flush();
