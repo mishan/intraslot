@@ -28,7 +28,8 @@
     "test:cluster": "bash scripts/with-cluster.sh node --test test/cluster.test.js",
     "bench": "bash scripts/with-cluster.sh node test/bench.js",
     "gen-table": "node scripts/gen-slot-table.js",
-    "types": "tsc -p jsconfig.json"
+    "types": "tsc -p jsconfig.json",
+    "prepack": "npm run types"
   },
   "keywords": [
     "redis",
@@ -46,7 +47,8 @@
     "ioredis": ">=5"
   },
   "devDependencies": {
+    "cluster-key-slot": "^1.1.2",
     "ioredis": "^5.4.1",
-    "cluster-key-slot": "^1.1.2"
+    "typescript": "7.0.2"
   }
 }
