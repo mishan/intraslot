@@ -2,6 +2,7 @@
 /** @module intraslot/coalescer */
 
 const { EventEmitter } = require('events');
+const { performance } = require('perf_hooks');
 
 /**
  * @typedef {object} CoalescerOptions
@@ -58,7 +59,10 @@ class Coalescer extends EventEmitter {
     this._remove = new Set();
     this._flushing = false;
     this._closed = false;
-    /** When the last flush started, in ms since the epoch. */
+    /**
+     * When the last flush started, or failed, on the monotonic clock: a
+     * wall-clock step must not stretch or skip a tick.
+     */
     this._lastStart = -Infinity;
     /** @type {NodeJS.Timeout|null} */
     this._timer = null;
@@ -102,7 +106,7 @@ class Coalescer extends EventEmitter {
    */
   _schedule() {
     if (this._timer || this._closed || this.pending === 0) return;
-    const wait = Math.max(0, this._lastStart + this.tickMs - Date.now());
+    const wait = Math.max(0, this._lastStart + this.tickMs - performance.now());
     this._timer = setTimeout(() => {
       this._timer = null;
       this._maybeFlush();
@@ -134,7 +138,10 @@ class Coalescer extends EventEmitter {
     this._add = new Set();
     this._remove = new Set();
     this._flushing = true;
-    this._lastStart = Date.now();
+    this._lastStart = performance.now();
+    // A timer armed for the previous tick would fire too soon after this flush.
+    if (this._timer) clearTimeout(this._timer);
+    this._timer = null;
 
     this._inflight = (async () => {
       try {
@@ -151,6 +158,8 @@ class Coalescer extends EventEmitter {
         });
         return result;
       } catch (err) {
+        // Wait a full tick before retrying, however long this attempt took.
+        this._lastStart = performance.now();
         // Put the delta back so the next tick retries it, without clobbering
         // changes queued while this flush was in flight.
         for (const m of add) if (!this._remove.has(m)) this._add.add(m);
