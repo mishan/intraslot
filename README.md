@@ -173,7 +173,10 @@ members, and servers that refuse the script, use the plain commands throughout.
 
 Ticks never overlap, and a member added and removed within one tick resolves to
 the last write. The cost is staleness bounded by one tick — fine for presence,
-wrong wherever a stale read is *incorrect* rather than merely dated.
+wrong wherever a stale read is *incorrect* rather than merely dated. Only busy
+sets pay it: a change that arrives when no flush has started for a tick is
+applied at once, so a rarely changing set sees its writes land in about one
+fanout's time (~20 ms above) rather than up to `tickMs`.
 
 ### One writer per set
 

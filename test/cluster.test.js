@@ -395,7 +395,7 @@ test('coalescer batches churn into ticks and converges', async () => {
 test('coalescer add/remove of the same member resolves to last write', async () => {
   const fan = new IntraSlot(cluster, { name: 'setB' });
   await fan.publish([]);
-  const c = fan.coalescer({ tickMs: 10000 }); // never ticks on its own
+  const c = fan.coalescer({ tickMs: 10000 });
 
   c.add('x');
   c.remove('x');
@@ -407,6 +407,53 @@ test('coalescer add/remove of the same member resolves to last write', async () 
 
   const members = await fan.smembers(SUBS);
   assert.deepStrictEqual(members.sort(), ['y', 'z']);
+});
+
+/** Resolves with the time of `c`'s next flush, or rejects after `ms`. */
+function nextFlush(c, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`no flush within ${ms} ms`)), ms);
+    c.once('flush', () => {
+      clearTimeout(timer);
+      resolve(Date.now());
+    });
+  });
+}
+
+test('coalescer applies a change queued while a flush is running', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setQ' });
+  await fan.publish([]);
+  const c = fan.coalescer({ tickMs: 1 }); // the tick ends before the flush does
+  try {
+    c.add('a');
+    const first = c.flush();
+    c.add('b');
+    await first;
+    await nextFlush(c, 2000);
+    assert.deepStrictEqual((await fan.smembers(SUBS)).sort(), ['a', 'b']);
+  } finally {
+    await c.close();
+  }
+});
+
+test('coalescer flushes a change after idle at once, then holds the next for a tick', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setP' });
+  await fan.publish([]);
+  const tickMs = 2000;
+  const c = fan.coalescer({ tickMs });
+  try {
+    const start = Date.now();
+    c.add('first');
+    await nextFlush(c, tickMs / 2);
+    assert.deepStrictEqual(await fan.smembers(SUBS), ['first']);
+
+    c.add('second');
+    const second = await nextFlush(c, tickMs * 2);
+    assert.ok(second - start >= tickMs, `second flush after ${second - start} ms`);
+    assert.deepStrictEqual((await fan.smembers(SUBS)).sort(), ['first', 'second']);
+  } finally {
+    await c.close();
+  }
 });
 
 test('clear removes every replica', async () => {
