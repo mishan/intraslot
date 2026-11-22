@@ -1,6 +1,7 @@
 'use strict';
 /** @module intraslot */
 
+const crypto = require('crypto');
 const { NUM_SLOTS, slotFor } = require('./slot');
 const { TAGS, verifyTable } = require('./table');
 const { CrossSlotError, PartialPublishError } = require('./errors');
@@ -30,27 +31,58 @@ const { CrossSlotError, PartialPublishError } = require('./errors');
 
 const DEFAULTS = { stagingName: 'intraslot:staging', verify: true, chunkSize: 2048 };
 
-// Applies one delta to many replicas on one node, so the members cross the wire
-// once per call instead of once per replica. Key names go in ARGV because
-// allow-cross-slot-keys still rejects declared KEYS from different slots.
-// unpack() is chunked to stay under Lua's C stack limit (~8000 values).
-// ARGV: nkeys, nremove, nadd, keys..., removals..., additions...
 // Errors meaning this server will never run DELTA_SCRIPT for us.
 const SCRIPT_REFUSED =
   /^(NOPERM|ERR unknown command|ERR Error compiling script|ERR Unexpected flag|ERR ACL failure in script)/;
 
+// The slot table, packed so the script can name any replica itself: tags are at
+// most TAG_WIDTH digits, space-padded, and TAG_LENGTHS holds each one's length.
+const TAG_WIDTH = 6;
+const PACKED_TAGS = TAGS.map((t) => t.padEnd(TAG_WIDTH)).join('');
+const TAG_LENGTHS = TAGS.map((t) => t.length).join('');
+
+// Applies one delta to the replicas in some slot ranges on one node, building
+// their names from the embedded table, so neither key names nor a command per
+// replica cross the wire. No keys are declared because allow-cross-slot-keys
+// still rejects declared KEYS from different slots.
+// unpack() is chunked to stay under Lua's C stack limit (~8000 values).
+// ARGV: key prefix + name, nranges, nremove, nadd,
+//       (first slot, last slot) x nranges, removals..., additions...
 const DELTA_SCRIPT = `#!lua flags=allow-cross-slot-keys
-local nk, nr, na = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local TAGS, LENGTHS = "${PACKED_TAGS}", "${TAG_LENGTHS}"
+local head = ARGV[1] .. ':{'
+local ng, nr, na = tonumber(ARGV[2]), tonumber(ARGV[3]), tonumber(ARGV[4])
+local base = 5 + 2 * ng
 local function apply(cmd, key, from, n)
   for i = from, from + n - 1, 4096 do
     redis.call(cmd, key, unpack(ARGV, i, math.min(i + 4095, from + n - 1)))
   end
 end
-for i = 4, 3 + nk do
-  apply('SREM', ARGV[i], 4 + nk, nr)
-  apply('SADD', ARGV[i], 4 + nk + nr, na)
+for g = 0, ng - 1 do
+  for slot = tonumber(ARGV[5 + 2 * g]), tonumber(ARGV[6 + 2 * g]) do
+    local at = slot * ${TAG_WIDTH} + 1
+    local len = string.byte(LENGTHS, slot + 1) - 48
+    local key = head .. string.sub(TAGS, at, at + len - 1) .. '}'
+    apply('SREM', key, base, nr)
+    apply('SADD', key, base + nr, na)
+  end
 end
-return nk`;
+return 1`;
+const DELTA_SHA = crypto.createHash('sha1').update(DELTA_SCRIPT).digest('hex');
+
+/**
+ * Collapse ascending slot numbers into [first, last] runs.
+ * @param {number[]} slots
+ * @returns {number[]} first0, last0, first1, last1, ...
+ */
+function slotRanges(slots) {
+  const out = [];
+  for (const slot of slots) {
+    if (out.length && out[out.length - 1] === slot - 1) out[out.length - 1] = slot;
+    else out.push(slot, slot);
+  }
+  return out;
+}
 
 /**
  * A set replicated to all 16384 slots, so it can be intersected server-side
@@ -94,6 +126,8 @@ class IntraSlot {
     this._lastWrite = Promise.resolve();
     /** Cleared once a server shows it cannot run DELTA_SCRIPT. @private */
     this._useScript = true;
+    /** In-flight SCRIPT LOADs, by node. @private @type {Map<Redis, Promise<string>>} */
+    this._loading = new Map();
   }
 
   // -- addressing ----------------------------------------------------------
@@ -402,11 +436,18 @@ class IntraSlot {
    * @private
    */
   async _viaScript(node, batch, delta, viaPipeline) {
-    // ioredis prefixes declared KEYS only, and these are passed as ARGV.
-    const keys = batch.map((slot) => this._keyPrefix + this.keys[slot]);
-    const args = [keys.length, delta.remove.length, delta.add.length];
+    const ranges = slotRanges(batch);
+    // ioredis prefixes declared KEYS only, and the script builds its own.
+    const args = [
+      this._keyPrefix + this.name, ranges.length / 2, delta.remove.length, delta.add.length,
+      ...ranges, ...delta.remove, ...delta.add,
+    ];
     try {
-      await node.eval(DELTA_SCRIPT, 0, ...args, ...keys, ...delta.remove, ...delta.add);
+      await node.evalsha(DELTA_SHA, 0, ...args).catch(async (err) => {
+        if (!/^NOSCRIPT/.test(err.message)) throw err;
+        await this._loadScript(node);
+        return node.evalsha(DELTA_SHA, 0, ...args);
+      });
       return { slots: batch };
     } catch (err) {
       if (SCRIPT_REFUSED.test(err.message)) this._useScript = false;
@@ -415,6 +456,20 @@ class IntraSlot {
       // errors get pinned to their own slots.
       return viaPipeline(batch);
     }
+  }
+
+  /**
+   * SCRIPT LOAD the delta script on `node`, sharing one load among every call
+   * that found it missing, rather than resending the ~115 KB body with each.
+   * @private
+   */
+  _loadScript(node) {
+    let load = this._loading.get(node);
+    if (!load) {
+      load = node.script('LOAD', DELTA_SCRIPT).finally(() => this._loading.delete(node));
+      this._loading.set(node, load);
+    }
+    return load;
   }
 
   // -- writes --------------------------------------------------------------
@@ -579,4 +634,4 @@ class IntraSlot {
   }
 }
 
-module.exports = { IntraSlot };
+module.exports = { IntraSlot, slotRanges };

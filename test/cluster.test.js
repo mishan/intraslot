@@ -149,7 +149,7 @@ async function netInputBytes() {
   return infos.reduce((sum, s) => sum + Number(/total_net_input_bytes:(\d+)/.exec(s)[1]), 0);
 }
 
-test('a small delta sends each replica key about once, not a command per replica', async () => {
+test('a small delta sends neither a command nor a key name per replica', async () => {
   const fan = new IntraSlot(cluster, { name: 'setE' });
   await fan.publish(['a']);
 
@@ -158,8 +158,23 @@ test('a small delta sends each replica key about once, not a command per replica
   const sent = (await netInputBytes()) - before;
 
   assert.deepStrictEqual(await fan.smembers(SUBS), ['b']);
-  // A pipelined SREM + SADD per replica costs ~80 bytes each.
-  assert.ok(sent < 16384 * 30, `sent ${sent} bytes for a +1/-1 delta`);
+  // Even one byte per replica would be 16 KB.
+  assert.ok(sent < 16384, `sent ${sent} bytes for a +1/-1 delta`);
+});
+
+test('a server without the script cached is sent it once, not per call', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setM' });
+  await fan.publish(['a']);
+  await Promise.all(cluster.nodes('master').map((n) => n.script('FLUSH')));
+
+  const before = await netInputBytes();
+  await fan.applyDelta({ add: ['b'], remove: ['a'] });
+  const sent = (await netInputBytes()) - before;
+
+  assert.deepStrictEqual(await fan.smembers(SUBS), ['b']);
+  // The script is ~115 KB, so three nodes need ~350 KB; resending it with every
+  // call would be several MB.
+  assert.ok(sent < 500_000, `sent ${sent} bytes`);
 });
 
 test('a replica the delta cannot write fails alone, the rest still converge', async () => {
@@ -203,27 +218,28 @@ test('a batch that errors out counts all its slots as failed', async () => {
     throw new Error('Connection is closed.');
   };
   const pipeline = node.pipeline;
-  node.eval = lost;
+  node.evalsha = lost;
   node.pipeline = (...args) => Object.assign(pipeline.apply(node, args), { exec: lost });
   let result;
   try {
     result = await fan.applyDelta({ add: ['b'] });
   } finally {
-    delete node.eval;
+    delete node.evalsha;
     delete node.pipeline;
   }
   assert.strictEqual(result.failed, owned);
 });
 
-async function rejectedEvals(c) {
+async function rejectedScripts(c) {
   const infos = await Promise.all(c.nodes('master').map((n) => n.info('commandstats')));
-  return infos.reduce((sum, s) => sum + Number((/cmdstat_eval:.*rejected_calls=(\d+)/.exec(s) || [0, 0])[1]), 0);
+  const rejected = (s) => [...s.matchAll(/cmdstat_eval(?:sha)?:.*rejected_calls=(\d+)/g)];
+  return infos.reduce((sum, s) => rejected(s).reduce((t, m) => t + Number(m[1]), sum), 0);
 }
 
-test('a server that refuses EVAL is not asked again', async () => {
+test('a server that refuses scripts is not asked again', async () => {
   const masters = cluster.nodes('master');
   const acl = (...args) => Promise.all(masters.map((n) => n.call('ACL', ...args)));
-  await acl('SETUSER', 'noeval', 'on', 'nopass', '~*', '&*', '+@all', '-eval');
+  await acl('SETUSER', 'noeval', 'on', 'nopass', '~*', '&*', '+@all', '-eval', '-evalsha');
   const limited = new Redis.Cluster(NODES, { redisOptions: { username: 'noeval' } });
   try {
     await new Promise((resolve, reject) => {
@@ -233,11 +249,11 @@ test('a server that refuses EVAL is not asked again', async () => {
     const fan = new IntraSlot(limited, { name: 'setJ' });
     await fan.publish(['a']);
     await fan.add(['b']);
-    const before = await rejectedEvals(limited);
-    assert.ok(before > 0, 'the first write should have tried EVAL');
+    const before = await rejectedScripts(limited);
+    assert.ok(before > 0, 'the first write should have tried a script');
 
     await fan.add(['c']);
-    assert.strictEqual(await rejectedEvals(limited), before);
+    assert.strictEqual(await rejectedScripts(limited), before);
     assert.deepStrictEqual((await fan.smembers(SUBS)).sort(), ['a', 'b', 'c']);
   } finally {
     limited.disconnect();

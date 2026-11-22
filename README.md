@@ -157,12 +157,18 @@ sustainable tick rate                          : ~44 Hz
 verify across 256 sampled replicas             : CONSISTENT
 ```
 
-So a 250 ms tick has roughly 10x headroom. Deltas are applied by Lua calls
-(`allow-cross-slot-keys`, Redis 7+) that each cover about `chunkSize / delta
-size` replicas, 204 for the delta above, so the members cross the wire once
-per call rather than once per replica. A call that fails is replayed as plain
-per-replica commands. Deltas of more than `chunkSize / 2` members, and servers
-that refuse the script, use the plain commands throughout.
+So a 250 ms tick has roughly 10x headroom. Deltas are applied by a Lua script
+(`allow-cross-slot-keys`, Redis 7+) that embeds the slot table, so each call
+names a range of slots and the script builds the replica keys itself. Each call
+covers about `chunkSize / delta size` replicas, 204 for the delta above. Neither
+key names nor a command per replica cross the wire: the +6/-4 tick above sends
+about 20 KB, where per-replica commands send about 300 KB. That matters most
+where traffic is metered, such as across availability zones.
+
+The ~115 KB script is loaded once per node and called by its SHA after that. A
+call that fails is replayed as plain per-replica commands. Deltas of more than
+`chunkSize / 2` members, and servers that refuse the script, use the plain
+commands throughout.
 
 Ticks never overlap, and a member added and removed within one tick resolves to
 the last write. The cost is staleness bounded by one tick — fine for presence,
