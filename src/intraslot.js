@@ -50,9 +50,10 @@ const TAG_LENGTHS = TAGS.map((t) => t.length).join('');
 
 // Writes the replicas in some slot ranges on one node, building their names
 // from the embedded table, so neither key names nor a command per replica cross
-// the wire. Each replica is replaced (DEL, then SADD) or changed by a delta
+// the wire. Each replica is replaced (UNLINK, then SADD) or changed by a delta
 // (SREM, then SADD); a script runs atomically, so readers never see a replica
-// half-replaced. No keys are declared because allow-cross-slot-keys still
+// half-replaced. UNLINK rather than DEL so a large old set is freed in the
+// background instead of inside the call, which scriptBudget does not count. No keys are declared because allow-cross-slot-keys still
 // rejects declared KEYS from different slots, and the same rule keeps COPY from
 // cloning one replica into another.
 // unpack() is chunked to stay under Lua's C stack limit (~8000 values).
@@ -73,13 +74,33 @@ for g = 0, ng - 1 do
     local at = slot * ${TAG_WIDTH} + 1
     local len = string.byte(LENGTHS, slot + 1) - 48
     local key = head .. string.sub(TAGS, at, at + len - 1) .. '}'
-    if replace then redis.call('DEL', key) end
+    if replace then redis.call('UNLINK', key) end
     apply('SREM', key, base, nr)
     apply('SADD', key, base + nr, na)
   end
 end
 return 1`;
 const WRITE_SHA = crypto.createHash('sha1').update(WRITE_SCRIPT).digest('hex');
+
+/** In-flight SCRIPT LOADs, by server address. @type {Map<string, Promise<string>>} */
+const loading = new Map();
+
+/**
+ * SCRIPT LOAD the write script on `node`, sharing one load among every call
+ * that found it missing, from any instance, rather than resending the ~115 KB
+ * body with each.
+ * @param {Redis} node
+ * @returns {Promise<string>}
+ */
+function loadScript(node) {
+  const addr = `${node.options.host}:${node.options.port}`;
+  let load = loading.get(addr);
+  if (!load) {
+    load = node.script('LOAD', WRITE_SCRIPT).finally(() => loading.delete(addr));
+    loading.set(addr, load);
+  }
+  return load;
+}
 
 /**
  * Collapse ascending slot numbers into [first, last] runs.
@@ -125,7 +146,9 @@ class IntraSlot {
     this.cluster = cluster;
     /** Name of this replicated set; also the key prefix. @type {string} */
     this.name = options.name;
-    this.opts = { ...DEFAULTS, ...options };
+    // An option passed as undefined, say from an unset config value, means the default.
+    const given = Object.entries(options).filter(([, v]) => v !== undefined);
+    this.opts = { ...DEFAULTS, ...Object.fromEntries(given) };
     if (this.opts.verify) verifyTable();
 
     /** All 16384 replica keys, precomputed once. @type {string[]} */
@@ -137,8 +160,6 @@ class IntraSlot {
     this._lastWrite = Promise.resolve();
     /** Cleared once a server shows it cannot run WRITE_SCRIPT. @private */
     this._useScript = true;
-    /** In-flight SCRIPT LOADs, by node. @private @type {Map<Redis, Promise<string>>} */
-    this._loading = new Map();
   }
 
   // -- addressing ----------------------------------------------------------
@@ -455,7 +476,7 @@ class IntraSlot {
     try {
       await node.evalsha(WRITE_SHA, 0, ...args).catch(async (err) => {
         if (!/^NOSCRIPT/.test(err.message)) throw err;
-        await this._loadScript(node);
+        await loadScript(node);
         return node.evalsha(WRITE_SHA, 0, ...args);
       });
       return { slots: batch };
@@ -466,20 +487,6 @@ class IntraSlot {
       // errors get pinned to their own slots.
       return viaPipeline(batch);
     }
-  }
-
-  /**
-   * SCRIPT LOAD the delta script on `node`, sharing one load among every call
-   * that found it missing, rather than resending the ~115 KB body with each.
-   * @private
-   */
-  _loadScript(node) {
-    let load = this._loading.get(node);
-    if (!load) {
-      load = node.script('LOAD', WRITE_SCRIPT).finally(() => this._loading.delete(node));
-      this._loading.set(node, load);
-    }
-    return load;
   }
 
   // -- writes --------------------------------------------------------------

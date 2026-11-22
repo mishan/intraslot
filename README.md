@@ -163,7 +163,10 @@ names a range of slots and the script builds the replica keys itself. The
 members cross the wire once per call, and neither key names nor a command per
 replica do: the +6/-4 tick above sends about 2 KB, where per-replica commands
 send about 300 KB, and a 200-member publish sends about 0.3 MB instead of 42 MB.
-That is most of why publish is about 7x faster than per-replica commands.
+That is most of why publish is about 7x faster than per-replica commands. The
+saving is between the client and the masters only: Redis replicates the
+commands a script runs, not the call, so replicas and the AOF still receive one
+write per replica.
 
 Each call writes at most `scriptBudget` members (default 32768, a few ms of
 blocking per call), across at most `chunkSize` replicas. The ~115 KB script is

@@ -18,6 +18,7 @@ const { IntraSlot, CrossSlotError, slotFor } = require('../src/index');
 const NODES = [{ host: '127.0.0.1', port: 7001 }];
 const USER = '1234567890';
 const SUBS = `subs:{${USER}}`;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** @type {import('ioredis').Cluster} */
 let cluster;
@@ -170,6 +171,7 @@ test('publish and clear send the members once per call, not once per replica', a
   let before = await netInputBytes();
   await fan.publish(members);
   const published = (await netInputBytes()) - before;
+  assert.strictEqual((await fan.verify({ sample: 0 })).majority, 200);
   before = await netInputBytes();
   await fan.clear();
   const cleared = (await netInputBytes()) - before;
@@ -180,17 +182,59 @@ test('publish and clear send the members once per call, not once per replica', a
   assert.strictEqual((await fan.verify({ sample: 0 })).majority, 0);
 });
 
+async function scriptCalls() {
+  const infos = await Promise.all(cluster.nodes('master').map((n) => n.info('commandstats')));
+  return infos.reduce((sum, s) => sum + Number((/cmdstat_evalsha:calls=(\d+)/.exec(s) || [0, 0])[1]), 0);
+}
+
 test('a script call writes at most scriptBudget members', async () => {
   const fan = new IntraSlot(cluster, { name: 'setO', scriptBudget: 1000 });
-  const calls = async () => {
-    const infos = await Promise.all(cluster.nodes('master').map((n) => n.info('commandstats')));
-    return infos.reduce((sum, s) => sum + Number((/cmdstat_evalsha:calls=(\d+)/.exec(s) || [0, 0])[1]), 0);
-  };
-  const before = await calls();
+  const before = await scriptCalls();
   await fan.publish(Array.from({ length: 100 }, (_, i) => `user${i}`));
   // 100 members within a budget of 1000 means 10 replicas per call.
-  assert.ok((await calls()) - before >= 16384 / 10);
+  assert.ok((await scriptCalls()) - before >= 16384 / 10);
   assert.strictEqual((await fan.verify({ sample: 0 })).majority, 100);
+});
+
+test('undefined options fall back to the defaults', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setS', chunkSize: undefined, scriptBudget: undefined });
+  const before = await scriptCalls();
+  await fan.publish(['a']);
+  assert.ok((await scriptCalls()) > before, 'publish should use the script');
+  assert.strictEqual((await fan.verify({ sample: 0 })).majority, 1);
+});
+
+async function lazyfreed() {
+  const infos = await Promise.all(cluster.nodes('master').map((n) => n.info('memory')));
+  return infos.reduce((sum, s) => sum + Number(/lazyfreed_objects:(\d+)/.exec(s)[1]), 0);
+}
+
+test('replacing or clearing large replicas frees them in the background', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setR' });
+  // UNLINK frees a set in the background only if it is a hashtable of more
+  // than 64 elements; under 128 members it would be a single listpack.
+  const large = Array.from({ length: 200 }, (_, i) => `user${i}`);
+  await fan.publish(large);
+  let before = await lazyfreed();
+  await fan.publish(['x']);
+  await fan.publish(large);
+  await fan.clear();
+  // Background frees are counted once done, so allow them a moment.
+  for (let i = 0; i < 50 && (await lazyfreed()) - before < 2 * 16384; i++) await sleep(20);
+  assert.strictEqual((await lazyfreed()) - before, 2 * 16384);
+});
+
+test('instances share one script load per node', async () => {
+  const fans = ['setT1', 'setT2'].map((name) => new IntraSlot(cluster, { name }));
+  await Promise.all(fans.map((fan) => fan.publish(['a'])));
+  await Promise.all(cluster.nodes('master').map((n) => n.script('FLUSH')));
+
+  const before = await netInputBytes();
+  await Promise.all(fans.map((fan) => fan.add(['b'])));
+  const sent = (await netInputBytes()) - before;
+
+  // One ~115 KB load per node is ~350 KB; one per instance would be ~700 KB.
+  assert.ok(sent < 500_000, `sent ${sent} bytes`);
 });
 
 test('a server without the script cached is sent it once, not per call', async () => {
@@ -204,7 +248,7 @@ test('a server without the script cached is sent it once, not per call', async (
 
   assert.deepStrictEqual(await fan.smembers(SUBS), ['b']);
   // The script is ~115 KB, so three nodes need ~350 KB; resending it with every
-  // call would be several MB.
+  // call would be about 1 MB.
   assert.ok(sent < 500_000, `sent ${sent} bytes`);
 });
 
