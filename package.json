@@ -1,6 +1,6 @@
 {
   "name": "intraslot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Server-side set intersection for Redis Cluster: replicate a set to every hash slot so it stays co-slotted with any sharded key",
   "main": "src/index.js",
   "types": "types/index.d.ts",
