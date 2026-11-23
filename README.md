@@ -88,7 +88,8 @@ intersect at all, and it loses coverage on 96.7% of simulated reshards.
 npm install intraslot ioredis
 ```
 
-`ioredis` is a peer dependency. Node 18+.
+`ioredis` is a peer dependency. Node 18+, and Redis 7+ or Valkey 8+: CI runs the
+live-cluster tests against Redis 7.0 and 8.10 and Valkey 8.1 and 9.1.
 
 ## Usage
 
@@ -172,7 +173,20 @@ Each call writes at most `scriptBudget` members (default 32768, a few ms of
 blocking per call), across at most `chunkSize` replicas. The ~115 KB script is
 loaded once per node and called by its SHA after that. A call that fails is
 replayed as plain per-replica commands. Writes of more than `scriptBudget / 2`
-members, and servers that refuse the script, use the plain commands throughout.
+members, and servers or ACL users that refuse the script, use the plain
+commands throughout.
+
+A replacement (`publish`, `reconcile`) is built in a co-slotted staging key and
+swapped in, so a slot caught mid-migration keeps its old set rather than
+losing it. That needs `RENAME` and read and write access to the staging keys
+(`<keyPrefix><stagingName>:*`, by default `intraslot:staging:*`), in the same
+ACL selector as the replica keys. Without them, or where `rename-command` has
+renamed `RENAME`, the script replaces in place instead, as before this check
+existed, and a replacement caught mid-migration can leave that slot's replica
+empty until a later write reaches it. The plain per-replica commands always
+stage and `RENAME`, so for such a user they fail: replacements of more than
+`scriptBudget / 2` members, and a script batch that falls back because one of
+its slots is mid-migration, are reported failed (NOPERM) for the whole batch.
 
 Ticks never overlap, and a member added and removed within one tick resolves to
 the last write. The cost is staleness bounded by one tick — fine for presence,
@@ -222,8 +236,8 @@ members computed on the server, so a replica with the right number of the wrong
 members is caught too (`contents: true`). The digest script is read-only, so
 it still runs on a master refusing writes. A replica that cannot be read, such
 as a key of the wrong type, counts as drifted, and `verify` throws if it could
-read none of its sample. Against a server that refuses scripts, only
-cardinalities are compared and `contents` is false. `reconcile()` republishes
+read none of its sample. Against a server or ACL user that refuses scripts,
+only cardinalities are compared and `contents` is false. `reconcile()` republishes
 to the affected slots only.
 
 Digesting costs a SHA-1 per member, so checking every replica is not cheap:
@@ -251,13 +265,13 @@ slot.
 | `slotOf(key)` | — | slot number, per Redis's own rule |
 | `assertSameSlot(keys)` | — | throws `CrossSlotError` with an explanation |
 | `smembers` / `sismember` / `scard` | | read the replica local to a key |
-| `publish(members)` | replace everywhere; atomic per replica |
-| `add` / `remove` / `applyDelta(delta, {slots})` | incremental fanout, optionally to chosen slots |
-| `clear()` | delete every replica |
-| `catchUp()` / `behind` | retry / count slots that missed writes |
-| `verify({sample})` | drift report |
-| `reconcile(members, [slots])` | repair drifted replicas |
-| `coalescer(opts)` | tick-based publisher for high churn |
+| `publish(members, {retries})` | | replace everywhere; atomic per replica; when only a slot migration blocked it, retries for about a second |
+| `add` / `remove` / `applyDelta(delta, {slots})` | | incremental fanout, optionally to chosen slots |
+| `clear({retries})` | | delete every replica, retrying as `publish` does |
+| `catchUp([slots])` / `behind` | | retry / count slots that missed writes |
+| `verify({sample})` | | drift report |
+| `reconcile(members, [slots], {retries})` | | repair drifted replicas, retrying as `publish` does |
+| `coalescer(opts)` | | tick-based publisher for high churn |
 
 `publish()` replaces each replica inside a script call, or on the per-replica
 fallback stages the members under a co-slotted key and `RENAME`s it over the live
@@ -290,7 +304,10 @@ mismatch means a corrupt artifact, never an update. `npm test` checks:
 `npm run test:cluster` brings up a real 3-node cluster and checks the claims that
 only a server can settle: `SINTER` succeeds on the fanout key and is rejected on
 a naive one, the same holds inside Lua, publish reaches all 16384 replicas,
-`verify`/`reconcile` detect and repair drift, and the coalescer converges.
+`verify`/`reconcile` detect and repair drift, and the coalescer converges. It
+needs `redis-server` and `redis-cli` on `PATH`. Valkey's official images provide
+both names; with Valkey installed elsewhere, put links by those names first on
+`PATH`.
 
 ### A note on `cluster-key-slot`
 

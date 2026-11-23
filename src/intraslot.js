@@ -16,7 +16,8 @@ const { CrossSlotError, PartialPublishError } = require('./errors');
  * @property {string} name         name of the replicated set, e.g. "active".
  *   Replicas are stored as `<name>:{tag}`, one per slot, but the name is the
  *   set's identity -- it is the second operand of every operation below.
- * @property {string} [stagingName] name for staging keys used by atomic publish
+ * @property {string} [stagingName] name for the staging keys a replacement is
+ *   built in; swapping one in needs RENAME and access to `<keyPrefix><stagingName>:*`
  * @property {boolean} [verify]    verify the shipped slot table on construction (default true)
  * @property {number} [chunkSize]  max keys per pipeline or script call (default 2048)
  * @property {number} [scriptBudget] max member writes per script call, which
@@ -31,6 +32,9 @@ const { CrossSlotError, PartialPublishError } = require('./errors');
  * @property {number[]} failedSlots
  * @property {number} [behind] slots still waiting to catch up after this write,
  *   from it or an earlier one
+ * @property {Record<number, string>} [errors] the first error for each slot that
+ *   failed in this call, including slots behind from earlier writes that it
+ *   retried, which are not in `failedSlots`
  */
 
 const DEFAULTS = {
@@ -42,7 +46,7 @@ const DEFAULTS = {
 
 // Errors meaning this server will never run WRITE_SCRIPT for us.
 const SCRIPT_REFUSED =
-  /^(NOPERM|ERR unknown command|ERR Error compiling script|ERR Unexpected flag|ERR ACL failure in script)/;
+  /^(NOPERM|ERR unknown command|ERR Error compiling script|ERR Unexpected flag|ERR ACL failure in script|ERR The user executing the script can't run this command)/;
 
 // The slot table, packed so the script can name any replica itself: tags are at
 // most TAG_WIDTH digits, space-padded, and TAG_LENGTHS holds each one's length.
@@ -52,11 +56,14 @@ const TAG_LENGTHS = TAGS.map((t) => t.length).join('');
 
 // Works on the replicas in some slot ranges on one node, building their names
 // from the embedded table, so neither key names nor a command per replica cross
-// the wire. Each replica is replaced (UNLINK, then SADD), changed by a delta
-// (SREM, then SADD), or read back as a digest of its members. A script runs
-// atomically, so readers never see a replica half-replaced. UNLINK rather than
-// DEL so a large old set is freed in the background instead of inside the call,
-// which scriptBudget does not count. No keys are declared because
+// the wire. Each replica is replaced, changed by a delta (SREM, then SADD), or
+// read back as a digest of its members. A replacement is built in a co-slotted
+// staging key and swapped in (UNLINK, RENAME): scripts do not roll back, and in
+// a slot mid-migration the first write to a key that is not there fails, so
+// writing the staging key first leaves the old replica whole if the call fails.
+// A script runs atomically, so readers never see a replica half-replaced.
+// UNLINK rather than DEL so a large old set is freed in the background instead
+// of inside the call, which scriptBudget does not count. No keys are declared because
 // allow-cross-slot-keys still rejects declared KEYS from different slots, and
 // the same rule keeps COPY from cloning one replica into another.
 // unpack() is chunked to stay under Lua's C stack limit (~8000 values).
@@ -66,12 +73,14 @@ const TAG_LENGTHS = TAGS.map((t) => t.length).join('');
 // as "?". A digest call stops once it has read nremove members (at least one
 // replica), so the caller learns how far it got from the length of the reply.
 // ARGV: key prefix + name, op (1 replace, 0 delta, d digest), nranges, nremove,
-//       nadd, (first slot, last slot) x nranges, removals..., additions...
+//       nadd, key prefix + staging name, (first slot, last slot) x nranges,
+//       removals..., additions...
 const SCRIPT_BODY = `
 local TAGS, LENGTHS = "${PACKED_TAGS}", "${TAG_LENGTHS}"
 local head, op = ARGV[1] .. ':{', ARGV[2]
 local ng, nr, na = tonumber(ARGV[3]), tonumber(ARGV[4]), tonumber(ARGV[5])
-local base = 6 + 2 * ng
+local stage = ARGV[6] .. ':{'
+local base = 7 + 2 * ng
 local function apply(cmd, key, from, n)
   for i = from, from + n - 1, 4096 do
     redis.call(cmd, key, unpack(ARGV, i, math.min(i + 4095, from + n - 1)))
@@ -90,17 +99,42 @@ local function digest(key)
 end
 local digests, read = {}, 0
 for g = 0, ng - 1 do
-  for slot = tonumber(ARGV[6 + 2 * g]), tonumber(ARGV[7 + 2 * g]) do
+  for slot = tonumber(ARGV[7 + 2 * g]), tonumber(ARGV[8 + 2 * g]) do
     local at = slot * ${TAG_WIDTH} + 1
     local len = string.byte(LENGTHS, slot + 1) - 48
-    local key = head .. string.sub(TAGS, at, at + len - 1) .. '}'
+    local tag = string.sub(TAGS, at, at + len - 1) .. '}'
+    local key = head .. tag
     if op == 'd' then
       local d, n = digest(key)
       digests[#digests + 1] = d
       read = read + math.max(1, n)
       if read >= nr then return digests end
+    elseif op == '1' and na > 0 then
+      local staging = stage .. tag
+      -- The old replica is unlinked before the RENAME, so the swap is only
+      -- safe if the RENAME is allowed. Without it, or without access to the
+      -- staging key, replace in place, which a failure mid-migration can
+      -- leave empty.
+      -- pcall: acl_check_cmd raises, rather than answering, for a RENAME that
+      -- rename-command has renamed or disabled.
+      local checked, allowed = pcall(redis.acl_check_cmd, 'RENAME', staging, key)
+      if checked and allowed then
+        redis.call('UNLINK', staging)
+        apply('SADD', staging, base + nr, na)
+        redis.call('UNLINK', key)
+        redis.call('RENAME', staging, key)
+      else
+        redis.call('UNLINK', key)
+        apply('SADD', key, base + nr, na)
+      end
+    elseif op == '1' then
+      -- One key per command: a multi-key command with a key missing is refused
+      -- mid-migration, and the staging key is usually missing. Skip the
+      -- staging key for a user who may not touch it.
+      redis.call('UNLINK', key)
+      local checked, allowed = pcall(redis.acl_check_cmd, 'UNLINK', stage .. tag)
+      if checked and allowed then redis.call('UNLINK', stage .. tag) end
     else
-      if op == '1' then redis.call('UNLINK', key) end
       apply('SREM', key, base, nr)
       apply('SADD', key, base + nr, na)
     end
@@ -410,9 +444,9 @@ class IntraSlot {
    * Group all 16384 replica keys by the node that currently owns them.
    *
    * A stale grouping is harmless: a write that gets MOVED or ASK is replayed
-   * through the cluster client. (A publish to a slot mid-migration can still
-   * fail, on TRYAGAIN, and is reported in `failedSlots`.) This exists purely so
-   * writes can be pipelined.
+   * through the cluster client. (A replace in a slot mid-migration can still
+   * fail, on ASK or TRYAGAIN, until its keys move; publish, clear and reconcile
+   * retry it for a while.) This exists purely so writes can be pipelined.
    *
    * @private
    * @param {Set<number>} [only] group just these slots
@@ -515,13 +549,13 @@ class IntraSlot {
     const settled = await Promise.all(jobs);
     /** @type {number[]} */
     const failedSlots = [];
-    /** @type {Error[]} */
-    const causes = [];
+    /** @type {Record<number, string>} */
+    const errors = {};
 
     for (const { slots, results, error } of settled) {
       if (error) {
         failedSlots.push(...slots);
-        causes.push(error);
+        for (const slot of slots) errors[slot] = error.message;
         continue;
       }
       if (!results) continue;
@@ -530,8 +564,10 @@ class IntraSlot {
       results.forEach(([err], idx) => {
         if (err) {
           const slot = slots[Math.floor(idx / perSlot)];
-          if (!failedSlots.includes(slot)) failedSlots.push(slot);
-          causes.push(err);
+          if (!(slot in errors)) {
+            failedSlots.push(slot);
+            errors[slot] = err.message;
+          }
         }
       });
     }
@@ -541,6 +577,7 @@ class IntraSlot {
       replicas: (only ? only.size : NUM_SLOTS) - failedSlots.length,
       failed: failedSlots.length,
       failedSlots,
+      errors,
       ms,
     };
   }
@@ -580,7 +617,10 @@ class IntraSlot {
   _argv(op, slots, nremove, nadd, values = []) {
     const ranges = slotRanges(slots);
     // ioredis prefixes declared KEYS only, and the script builds its own.
-    return [this._keyPrefix + this.name, op, ranges.length / 2, nremove, nadd, ...ranges, ...values];
+    return [
+      this._keyPrefix + this.name, op, ranges.length / 2, nremove, nadd,
+      this._keyPrefix + this.opts.stagingName, ...ranges, ...values,
+    ];
   }
 
   // -- writes --------------------------------------------------------------
@@ -600,16 +640,24 @@ class IntraSlot {
    * eventually consistent -- there is no cross-slot transaction, and there
    * cannot be -- so different nodes may briefly disagree.
    *
+   * When every slot it misses failed because a slot migration is under way,
+   * they are retried up to `retries` times over about a second before it
+   * reports them; any other failure among them means they are reported at
+   * once. Either way they stay behind, so later writes keep retrying them.
+   *
    * @param {Iterable<string>} members
-   * @param {{ throwOnPartial?: boolean }} [opts]
+   * @param {{ throwOnPartial?: boolean, retries?: number }} [opts] retries
+   *   defaults to 3; 0 reports migrating slots at once
    * @returns {Promise<PublishResult>}
    */
   async publish(members, opts = {}) {
-    const result = await this._write({ replace: true, add: new Set(members), remove: new Set() });
+    const t0 = process.hrtime.bigint();
+    const write = { replace: true, add: new Set(members), remove: new Set() };
+    const result = await this._retryMigrations(await this._write(write), opts.retries ?? 3, NUM_SLOTS);
+    result.ms = Number(process.hrtime.bigint() - t0) / 1e6;
     if (result.failed && opts.throwOnPartial !== false) {
-      throw new PartialPublishError(result.failed, NUM_SLOTS, [
-        new Error(`slots ${result.failedSlots.slice(0, 5).join(', ')} ...`),
-      ]);
+      const causes = result.failedSlots.slice(0, 5).map((slot) => new Error(`slot ${slot}: ${result.errors[slot]}`));
+      throw new PartialPublishError(result.failed, NUM_SLOTS, causes);
     }
     return result;
   }
@@ -655,21 +703,63 @@ class IntraSlot {
     return this._write({ replace: false, add, remove }, only);
   }
 
-  /** Delete every replica. @returns {Promise<PublishResult>} */
-  async clear() {
-    return this._write({ replace: true, add: new Set(), remove: new Set() });
+  /**
+   * Delete every replica, retrying slots caught mid-migration as publish does.
+   * @param {{ retries?: number }} [opts]
+   * @returns {Promise<PublishResult>}
+   */
+  async clear(opts = {}) {
+    const t0 = process.hrtime.bigint();
+    const write = { replace: true, add: new Set(), remove: new Set() };
+    const result = await this._retryMigrations(await this._write(write), opts.retries ?? 3, NUM_SLOTS);
+    result.ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    return result;
   }
 
   /**
    * Retry the slots that missed earlier writes, without writing anything new.
    * Every write retries them too; this is for when there is nothing to write.
-   * @returns {Promise<{ behind: number }>} slots still behind afterwards
+   * @param {Iterable<number>} [slots] retry just these of them
+   * @returns {Promise<{ behind: number, errors: Record<number, string> }>} slots
+   *   still behind afterwards, and why the retried ones failed
    */
-  catchUp() {
+  catchUp(slots) {
+    const only = slots ? new Set(slots) : undefined;
     return this._serialize(async () => {
-      await this._writeNow(null);
-      return { behind: this.behind };
+      const { behind, errors } = await this._writeNow(null, only);
+      return { behind, errors };
     });
+  }
+
+  /**
+   * Retry, through catchUp(), the slots a replacement missed while a slot
+   * migration made them fail (TRYAGAIN, ASK or MOVED once replayed), `retries`
+   * times, waiting 100, 300, then 600 ms before each (about a second for the
+   * default 3). Any other failure, such as a timeout, is returned at once:
+   * waiting it out again would only delay the caller.
+   * @private
+   * @param {PublishResult & { errors: Record<number, string> }} result
+   * @param {number} retries
+   * @param {number} total slots the write targeted
+   */
+  async _retryMigrations(result, retries, total) {
+    let { failedSlots, errors } = result;
+    const migrating = () => failedSlots.every((slot) => /^(TRYAGAIN|ASK|MOVED) /.test(errors[slot] || ''));
+    for (let attempt = 0; attempt < retries && failedSlots.length && migrating(); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, [100, 300, 600][attempt] ?? 600));
+      ({ errors } = await this.catchUp(failedSlots));
+      const behind = new Set(this._behind.flatMap((group) => group.slots));
+      failedSlots = failedSlots.filter((slot) => behind.has(slot));
+    }
+    const kept = Object.fromEntries(failedSlots.map((slot) => [slot, errors[slot] || result.errors[slot]]));
+    return {
+      ...result,
+      failedSlots,
+      failed: failedSlots.length,
+      replicas: total - failedSlots.length,
+      behind: this.behind,
+      errors: kept,
+    };
   }
 
   /** @private */
@@ -690,15 +780,26 @@ class IntraSlot {
    * @private
    * @param {{ replace: boolean, add: Set<string>, remove: Set<string> } | null} write
    * @param {Set<number>} [targets]
-   * @returns {Promise<PublishResult & { behind: number }>} the result for `write`
+   * @returns {Promise<PublishResult & { behind: number, errors: Record<number, string> }>}
+   *   the result for `write`, with `errors` also covering the retried slots
    */
   async _writeNow(write, targets) {
     const covers = (slot) => !targets || targets.has(slot);
     /** @type {{ slots: number[], replace: boolean, add: Set<string>, remove: Set<string> }[]} */
     const retry = [];
+    /** @type {{ slots: number[], replace: boolean, add: Set<string>, remove: Set<string> }[]} */
+    const next = [];
     /** @type {Set<number>} */
     const folded = new Set();
     for (const group of this._behind) {
+      if (!write) {
+        // Catching up: retry the targeted slots and keep the rest as they are.
+        const mine = group.slots.filter(covers);
+        const others = targets ? group.slots.filter((slot) => !covers(slot)) : [];
+        if (mine.length) retry.push({ ...group, slots: mine });
+        if (others.length) next.push({ ...group, slots: others });
+        continue;
+      }
       const covered = write ? group.slots.filter(covers) : [];
       const rest = covered.length ? group.slots.filter((slot) => !covers(slot)) : group.slots;
       if (rest.length) retry.push({ ...group, slots: rest });
@@ -711,7 +812,6 @@ class IntraSlot {
     }
 
     let result = null;
-    const next = [];
     if (write) {
       let only = targets;
       if (folded.size) {
@@ -721,12 +821,15 @@ class IntraSlot {
       result = await this._apply(write, only);
       if (result.failedSlots.length) next.push({ ...copyPending(write), slots: result.failedSlots });
     }
+    /** @type {Record<number, string>} */
+    const errors = { ...(result && result.errors) };
     for (const group of retry) {
-      const { failedSlots } = await this._apply(group, new Set(group.slots));
-      if (failedSlots.length) next.push({ ...group, slots: failedSlots });
+      const retried = await this._apply(group, new Set(group.slots));
+      if (retried.failedSlots.length) next.push({ ...group, slots: retried.failedSlots });
+      Object.assign(errors, retried.errors);
     }
     this._behind = next;
-    return result && { ...result, behind: this.behind };
+    return { ...result, behind: this.behind, errors };
   }
 
   /**
@@ -738,14 +841,17 @@ class IntraSlot {
     if (write.replace) {
       return this._fanoutNow((p, slot, pre) => {
         const key = pre + this.keys[slot];
+        const staging = `${pre}${this.opts.stagingName}:{${TAGS[slot]}}`;
         if (!add.length) {
+          // Not the staging key too: a user may lack access to it.
           p.del(key);
           return;
         }
-        const staging = `${pre}${this.opts.stagingName}:{${TAGS[slot]}}`;
         p.del(staging);
         p.sadd(staging, ...add);
         p.rename(staging, key);
+        // Removes the copy when the RENAME failed; after one that worked, a no-op.
+        p.del(staging);
       }, { replace: true, remove: [], add }, only);
     }
     const remove = [...write.remove];
@@ -869,12 +975,18 @@ class IntraSlot {
 
   /**
    * Repair drifted replicas by republishing to them only.
+   * Slots caught mid-migration are retried as publish does.
    * @param {Iterable<string>} members the authoritative set
    * @param {number[]} [slots] slots to repair; defaults to those verify() flags
+   * @param {{ retries?: number }} [opts]
    * @returns {Promise<{ repaired: number[] }>}
    */
-  reconcile(members, slots) {
-    return this._serialize(() => this._reconcileNow(members, slots));
+  async reconcile(members, slots, opts = {}) {
+    const { targets, result } = await this._serialize(() => this._reconcileNow(members, slots));
+    if (!targets.length) return { repaired: [] };
+    const { failedSlots } = await this._retryMigrations(result, opts.retries ?? 3, targets.length);
+    const failed = new Set(failedSlots);
+    return { repaired: targets.filter((slot) => !failed.has(slot)) };
   }
 
   /** @private */
@@ -884,12 +996,10 @@ class IntraSlot {
       const report = await this.verify({ sample: 0 });
       targets = report.drifted;
     }
-    if (!targets.length) return { repaired: [] };
+    if (!targets.length) return { targets, result: null };
 
     const write = { replace: true, add: new Set(members), remove: new Set() };
-    const { failedSlots } = await this._writeNow(write, new Set(targets));
-    const failed = new Set(failedSlots);
-    return { repaired: targets.filter((slot) => !failed.has(slot)) };
+    return { targets, result: await this._writeNow(write, new Set(targets)) };
   }
 
   /**

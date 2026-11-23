@@ -63,6 +63,8 @@ class Coalescer extends EventEmitter {
     this._remove = new Set();
     this._flushing = false;
     this._closed = false;
+    /** The final flush close() started, shared by every call. @type {Promise<void>|null} */
+    this._closing = null;
     /**
      * When the last flush started, or failed, on the monotonic clock: a
      * wall-clock step must not stretch or skip a tick.
@@ -83,6 +85,7 @@ class Coalescer extends EventEmitter {
    * @param {...string} members
    */
   add(...members) {
+    this._assertOpen();
     for (const m of members.flat()) {
       this._remove.delete(m);
       this._add.add(m);
@@ -96,12 +99,18 @@ class Coalescer extends EventEmitter {
    * @param {...string} members
    */
   remove(...members) {
+    this._assertOpen();
     for (const m of members.flat()) {
       this._add.delete(m);
       this._remove.add(m);
     }
     if (this.pending >= this.maxBuffer) this._maybeFlush();
     else this._schedule();
+  }
+
+  /** @private */
+  _assertOpen() {
+    if (this._closed) throw new Error('intraslot: this coalescer is closed; changes would never be sent');
   }
 
   /** @private @returns {boolean} whether a flush has anything to send */
@@ -131,14 +140,17 @@ class Coalescer extends EventEmitter {
 
   /**
    * Apply the buffered delta, or catch up slots that are behind, immediately.
-   * Safe to call directly; overlapping calls are serialized.
+   * Safe to call directly; overlapping calls are serialized. Rejects if the
+   * write fails, or if a 'flush' listener throws, though the write landed.
    * @returns {Promise<import('./intraslot').PublishResult|null>} null if nothing was pending
    */
   async flush() {
     if (this._flushing) {
-      // Wait for the in-flight flush rather than racing it.
-      await this._inflight;
-      return null;
+      // Wait for the in-flight flush rather than racing it, then send what it
+      // did not take. A 'flush' listener can keep starting flushes, so wait a
+      // bounded number; if one is still running, it will take these changes.
+      await this._settle();
+      return this._flushing ? this._inflight : this.flush();
     }
     if (!this._hasWork()) return null;
 
@@ -153,22 +165,11 @@ class Coalescer extends EventEmitter {
     this._timer = null;
 
     this._inflight = (async () => {
+      let result;
       try {
-        const result = add.size || remove.size
+        result = add.size || remove.size
           ? await this.fanout.applyDelta({ add, remove })
           : { ...(await this.fanout.catchUp()), ms: 0, failed: 0 };
-        /**
-         * @event Coalescer#flush
-         * @type {{ added: number, removed: number, ms: number, failed: number }}
-         * `failed` counts slots still behind, which later ticks retry.
-         */
-        this.emit('flush', {
-          added: add.size,
-          removed: remove.size,
-          ms: result.ms,
-          failed: result.behind ?? result.failed,
-        });
-        return result;
       } catch (err) {
         // Wait a full tick before retrying, however long this attempt took.
         this._lastStart = performance.now();
@@ -183,22 +184,58 @@ class Coalescer extends EventEmitter {
         // behind go next tick.
         this._schedule();
       }
+      // Only once the delta is sent, so a listener that throws cannot get it
+      // put back and sent again every tick.
+      /**
+       * @event Coalescer#flush
+       * @type {{ added: number, removed: number, ms: number, failed: number }}
+       * `failed` counts slots still behind, which later ticks retry.
+       */
+      this.emit('flush', {
+        added: add.size,
+        removed: remove.size,
+        ms: result.ms,
+        failed: result.behind ?? result.failed,
+      });
+      return result;
     })();
 
     return this._inflight;
   }
 
   /**
-   * Stop ticking and flush whatever remains.
+   * Wait for the flush in flight and for up to two more that 'flush' listeners
+   * start after it; a listener that flushes on every flush would never stop.
+   * @private
+   */
+  async _settle() {
+    for (let i = 0; i < 3 && this._flushing; i++) await this._inflight.catch(() => {});
+  }
+
+  /**
+   * Stop ticking and flush whatever remains. Every call waits for that flush,
+   * and rejects if it fails, or if a 'flush' listener throws. Changes that
+   * failed to send stay pending, and calling close() again tries once more.
    * @returns {Promise<void>}
    */
-  async close() {
-    if (this._closed) return;
-    this._closed = true;
-    if (this._timer) clearTimeout(this._timer);
-    this._timer = null;
-    if (this._flushing) await this._inflight.catch(() => {});
-    if (this._hasWork()) await this.flush();
+  close() {
+    if (!this._closing) {
+      this._closed = true;
+      if (this._timer) clearTimeout(this._timer);
+      this._timer = null;
+      this._closing = (async () => {
+        await this._settle();
+        if (this._hasWork()) await this.flush();
+        // A flush a 'flush' listener starts can follow that one.
+        await this._settle();
+        // Changes a failed listener-started flush put back.
+        if (this.pending) await this.flush();
+      })().catch((err) => {
+        this._closing = null;
+        throw err;
+      });
+    }
+    return this._closing;
   }
 }
 
