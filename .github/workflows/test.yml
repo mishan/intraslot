@@ -11,11 +11,25 @@ permissions:
 
 jobs:
   test:
+    name: test (node ${{ matrix.node }}, ${{ matrix.server }})
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
-        # The oldest and newest Node versions package.json supports.
-        node: [18, 24]
+        include:
+          # Ubuntu's redis-server, 7.0, on the oldest and newest supported Node.
+          - { node: 18, server: redis-7.0 }
+          - { node: 24, server: redis-7.0 }
+          # Newer servers, from their official images.
+          - node: 24
+            server: redis-8.10
+            image: redis:8.10.3@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
+          - node: 24
+            server: valkey-8.1
+            image: valkey/valkey:8.1.11@sha256:8f836008e0986c36adf50da714c7060cf689dbb335f61fe077939d90fa650809
+          - node: 24
+            server: valkey-9.1
+            image: valkey/valkey:9.1.3@sha256:3add1a336a920ea54770a001ab6feb3da5fceea96a40373a3a2cd469b815f0b7
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
@@ -32,7 +46,22 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
-      - name: Install redis-server for the cluster tests
+      - name: Install redis-server from Ubuntu
+        if: ${{ !matrix.image }}
         run: sudo apt-get update && sudo apt-get install -y redis-server
+      # Valkey's images also ship redis-server and redis-cli links, which the
+      # cluster script calls.
+      - name: Copy the server binaries out of the image
+        if: ${{ matrix.image }}
+        env:
+          IMAGE: ${{ matrix.image }}
+        shell: bash # with pipefail, so a failed docker export fails the step
+        run: |
+          id=$(docker create "$IMAGE")
+          mkdir -p "$RUNNER_TEMP/server"
+          docker export "$id" | tar -x -C "$RUNNER_TEMP/server" usr/local/bin
+          docker rm "$id"
+          echo "$RUNNER_TEMP/server/usr/local/bin" >> "$GITHUB_PATH"
+      - run: redis-server --version && redis-cli --version
       - run: npm test
       - run: npm run test:cluster

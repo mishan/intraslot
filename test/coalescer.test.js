@@ -113,3 +113,102 @@ test('ticks keep coming while slots are behind, with no new change', async () =>
     await c.close();
   }
 });
+
+test('changes after close() are refused, not silently held', async () => {
+  const c = new Coalescer(fakeFanout(), { tickMs: 20 });
+  await c.close();
+  assert.throws(() => c.add('x'), /closed/);
+  assert.throws(() => c.remove('x'), /closed/);
+});
+
+test('every close() call waits for the final flush', async () => {
+  const fanout = fakeFanout({ ms: 50 });
+  const c = new Coalescer(fanout, { tickMs: 1000 });
+  c.add('x');
+  const first = c.close();
+  await c.close();
+  assert.strictEqual(fanout.ends.length, 1, 'second close() returned before the flush finished');
+  await first;
+});
+
+test('a flush listener that throws does not get the delta sent again', async () => {
+  const fanout = fakeFanout();
+  const c = new Coalescer(fanout, { tickMs: 20 });
+  const errors = [];
+  c.on('error', (err) => errors.push(err));
+  c.once('flush', () => {
+    throw new Error('listener bug');
+  });
+  try {
+    c.add('x');
+    await sleep(150);
+    assert.strictEqual(fanout.starts.length, 1);
+    assert.strictEqual(c.pending, 0);
+    assert.match(errors[0].message, /listener bug/);
+  } finally {
+    await c.close();
+  }
+});
+
+test('close() tries again after its final flush failed', async () => {
+  const fanout = fakeFanout({ failures: 1 });
+  const c = new Coalescer(fanout, { tickMs: 1000 });
+  c.add('x');
+  await assert.rejects(() => c.close(), /boom/);
+  assert.strictEqual(c.pending, 1);
+  await c.close();
+  assert.strictEqual(c.pending, 0);
+  assert.strictEqual(fanout.starts.length, 2);
+});
+
+test('close() waits for a flush a flush listener starts', async () => {
+  const fanout = fakeFanout({ ms: 20 });
+  const c = new Coalescer(fanout, { tickMs: 1000 });
+  c.add('a');
+  const first = c.flush();
+  c.add('b');
+  c.once('flush', () => c.flush());
+  await c.close();
+  await first;
+  assert.strictEqual(fanout.ends.length, 2, 'close() resolved before the second flush landed');
+  assert.strictEqual(c.pending, 0);
+});
+
+test('flush() during another flush still sends its own changes', async () => {
+  const fanout = fakeFanout({ ms: 20 });
+  const c = new Coalescer(fanout, { tickMs: 1000 });
+  try {
+    c.add('a');
+    const first = c.flush();
+    c.add('b');
+    await c.flush();
+    await first;
+    assert.strictEqual(c.pending, 0);
+    assert.strictEqual(fanout.starts.length, 2);
+  } finally {
+    await c.close();
+  }
+});
+
+test('close() returns even if a flush listener keeps flushing', async () => {
+  const fanout = {
+    behind: 1,
+    calls: 0,
+    async applyDelta() {
+      this.calls++;
+      return { ms: 1, failed: 1, failedSlots: [5], behind: 1 };
+    },
+    async catchUp() {
+      this.calls++;
+      await sleep(1);
+      if (this.calls >= 50) this.behind = 0; // so the listener's loop ends
+      return { behind: this.behind };
+    },
+  };
+  const c = new Coalescer(fanout, { tickMs: 1000 });
+  c.on('flush', (stats) => stats.failed && c.flush());
+  c.add('x');
+  await c.close();
+  assert.ok(fanout.calls < 20, `close() waited through ${fanout.calls} fanouts`);
+  while (fanout.behind) await sleep(5);
+});

@@ -13,7 +13,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const Redis = require('ioredis');
 
-const { IntraSlot, CrossSlotError, slotFor } = require('../src/index');
+const { IntraSlot, CrossSlotError, PartialPublishError, slotFor } = require('../src/index');
 
 const NODES = [{ host: '127.0.0.1', port: 7001 }];
 const USER = '1234567890';
@@ -161,7 +161,7 @@ test('slots that miss writes catch up as if they had seen every write in order',
   }
   await cluster.sadd(fan.keys[slot], 'v'); // as if the replica came back as it was
 
-  assert.deepStrictEqual(await fan.catchUp(), { behind: 0 });
+  assert.strictEqual((await fan.catchUp()).behind, 0);
   assert.deepStrictEqual((await cluster.smembers(fan.keys[slot])).sort(), ['w', 'y']);
   assert.ok((await fan.verify({ sample: 0 })).consistent);
 });
@@ -180,6 +180,24 @@ test('a targeted write to some behind slots leaves the others as they were', asy
   await fan.catchUp();
   assert.deepStrictEqual((await cluster.smembers(fan.keys[one])).sort(), ['x', 'y']);
   assert.deepStrictEqual(await cluster.smembers(fan.keys[other]), ['x']);
+});
+
+test('catchUp(slots) retries just those slots', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setCE' });
+  await fan.publish([]);
+  const [fixed, broken] = [4242, 8000];
+  await Promise.all([fixed, broken].map((slot) => cluster.set(fan.keys[slot], 'not a set')));
+  try {
+    await fan.add(['x']);
+    assert.strictEqual(fan.behind, 2);
+    await cluster.del(fan.keys[fixed]);
+    const before = await scriptCalls();
+    assert.strictEqual((await fan.catchUp([fixed])).behind, 1);
+    assert.strictEqual((await scriptCalls()) - before, 1, 'retried more than the slot asked for');
+    assert.deepStrictEqual(await cluster.smembers(fan.keys[fixed]), ['x']);
+  } finally {
+    await cluster.del(fan.keys[broken]);
+  }
 });
 
 test('a publish supersedes what a behind slot missed', async () => {
@@ -607,6 +625,183 @@ test('verify reads a slot that moved since the client last looked', async () => 
   } finally {
     await (await startSlotMove(slot, dst, src))();
     await new Promise((resolve) => cluster.refreshSlotsCache(resolve));
+  }
+});
+
+for (const [label, retries] of [['retries a slot caught mid-migration', 3], ['reports it at once with retries: 0', 0]]) {
+  test(`publish ${label}`, async () => {
+    const fan = new IntraSlot(cluster, { name: `setCA${retries}` });
+    await fan.publish(['a']);
+    const slot = 100;
+    const masters = cluster.nodes('master');
+    const ids = await Promise.all(masters.map((n) => n.cluster('MYID')));
+    const src = masters.findIndex((n) => cluster.slots[slot][0] === `${n.options.host}:${n.options.port}`);
+    const dst = (src + 1) % masters.length;
+    // Mid-migration with the replica still on the source, a replace fails
+    // until its keys move. Move them, and hand the slot over, at the first
+    // retry, so the first attempt is sure to have failed.
+    await masters[dst].cluster('SETSLOT', slot, 'IMPORTING', ids[src]);
+    await masters[src].cluster('SETSLOT', slot, 'MIGRATING', ids[dst]);
+    let handedOver = false;
+    const catchUp = fan.catchUp.bind(fan);
+    fan.catchUp = async (...args) => {
+      if (!handedOver) {
+        const keys = await masters[src].cluster('GETKEYSINSLOT', slot, 1000);
+        await masters[src].migrate('127.0.0.1', masters[dst].options.port, '', 0, 5000, 'KEYS', ...keys);
+        await Promise.all(masters.map((n) => n.cluster('SETSLOT', slot, 'NODE', ids[dst])));
+        handedOver = true;
+      }
+      return catchUp(...args);
+    };
+    try {
+      if (retries) {
+        assert.strictEqual((await fan.publish(['b'], { retries })).failed, 0);
+        assert.ok(handedOver, 'publish never retried');
+        assert.deepStrictEqual(await cluster.smembers(fan.keys[slot]), ['b']);
+      } else {
+        await assert.rejects(
+          () => fan.publish(['b'], { retries }),
+          (err) => err instanceof PartialPublishError && /slot 100: (ASK|TRYAGAIN)/.test(err.message)
+        );
+        assert.ok(!handedOver, 'publish retried');
+      }
+    } finally {
+      if (handedOver) {
+        await (await startSlotMove(slot, dst, src))();
+      } else {
+        await Promise.all([src, dst].map((i) => masters[i].cluster('SETSLOT', slot, 'STABLE')));
+      }
+      await new Promise((resolve) => cluster.refreshSlotsCache(resolve));
+    }
+  });
+}
+
+test('a replace that a migration blocks leaves the old replica whole', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setCC' });
+  await fan.publish(['a', 'x']);
+  const slot = 100;
+  const masters = cluster.nodes('master');
+  const ids = await Promise.all(masters.map((n) => n.cluster('MYID')));
+  const src = masters.findIndex((n) => cluster.slots[slot][0] === `${n.options.host}:${n.options.port}`);
+  const dst = (src + 1) % masters.length;
+  await masters[dst].cluster('SETSLOT', slot, 'IMPORTING', ids[src]);
+  await masters[src].cluster('SETSLOT', slot, 'MIGRATING', ids[dst]);
+  try {
+    // The retry sends slot 100 alone, so a script call starts with it.
+    const result = await fan.publish(['b'], { retries: 1, throwOnPartial: false });
+    assert.deepStrictEqual(result.failedSlots, [slot]);
+    assert.deepStrictEqual((await masters[src].smembers(fan.keys[slot])).sort(), ['a', 'x']);
+    const staging = `intraslot:staging:{${require('../src/table').TAGS[slot]}}`;
+    assert.strictEqual(await masters[dst].call('ASKING').then(() => masters[dst].exists(staging)), 0);
+  } finally {
+    await Promise.all([src, dst].map((i) => masters[i].cluster('SETSLOT', slot, 'STABLE')));
+  }
+});
+
+test('a user who may not RENAME still publishes, replacing in place', async () => {
+  const fan = new IntraSlot(cluster, { name: 'setCD' });
+  await fan.publish(['a']);
+  const masters = cluster.nodes('master');
+  const acl = (...args) => Promise.all(masters.map((n) => n.call('ACL', ...args)));
+  await acl('SETUSER', 'norename', 'on', 'nopass', '~*', '&*', '+@all', '-rename');
+  const limited = new Redis.Cluster(NODES, { redisOptions: { username: 'norename' } });
+  try {
+    await new Promise((resolve, reject) => {
+      limited.once('ready', resolve);
+      limited.once('error', reject);
+    });
+    const own = new IntraSlot(limited, { name: 'setCD' });
+    assert.strictEqual((await own.publish(['b', 'c'])).failed, 0);
+    const report = await own.verify({ sample: 0 });
+    assert.strictEqual(report.contents, true, 'the script was switched off');
+    assert.ok(report.consistent);
+    assert.strictEqual(report.majority, 2);
+  } finally {
+    limited.disconnect();
+    await acl('DELUSER', 'norename');
+  }
+});
+
+test('a user who may not touch the staging keys can still publish and clear', async () => {
+  const masters = cluster.nodes('master');
+  const acl = (...args) => Promise.all(masters.map((n) => n.call('ACL', ...args)));
+  // Both with scripts and without, where every write takes the plain commands.
+  await acl('SETUSER', 'nostaging', 'on', 'nopass', '~setCG*', '&*', '+@all');
+  await acl('SETUSER', 'nostagingnoscript', 'on', 'nopass', '~setCG*', '&*', '+@all', '-@scripting');
+  const clients = ['nostaging', 'nostagingnoscript'].map(
+    (username) => new Redis.Cluster(NODES, { redisOptions: { username } })
+  );
+  try {
+    await Promise.all(clients.map((c) => new Promise((resolve, reject) => {
+      c.once('ready', resolve);
+      c.once('error', reject);
+    })));
+    for (const [i, client] of clients.entries()) {
+      const fan = new IntraSlot(client, { name: `setCG${i}` });
+      if (i === 0) assert.strictEqual((await fan.publish(['a', 'b'])).failed, 0, 'publish');
+      else await fan.add(['a', 'b']); // the plain path cannot replace without staging access
+      assert.strictEqual((await fan.clear()).failed, 0, `clear as user ${i}`);
+      assert.strictEqual(fan.behind, 0);
+    }
+  } finally {
+    clients.forEach((c) => c.disconnect());
+    await acl('DELUSER', 'nostaging', 'nostagingnoscript');
+  }
+});
+
+for (const [label, moveKeys] of [['still on the source', false], ['moved', true]]) {
+  test(`clear() empties a slot mid-migration with its keys ${label}`, async () => {
+    const fan = new IntraSlot(cluster, { name: `setCF${Number(moveKeys)}` });
+    await fan.publish(['a']);
+    const slot = 100;
+    const masters = cluster.nodes('master');
+    const ids = await Promise.all(masters.map((n) => n.cluster('MYID')));
+    const src = masters.findIndex((n) => cluster.slots[slot][0] === `${n.options.host}:${n.options.port}`);
+    const dst = (src + 1) % masters.length;
+    await masters[dst].cluster('SETSLOT', slot, 'IMPORTING', ids[src]);
+    await masters[src].cluster('SETSLOT', slot, 'MIGRATING', ids[dst]);
+    try {
+      if (moveKeys) {
+        const keys = await masters[src].cluster('GETKEYSINSLOT', slot, 1000);
+        await masters[src].migrate('127.0.0.1', masters[dst].options.port, '', 0, 5000, 'KEYS', ...keys);
+      }
+      assert.deepStrictEqual((await fan.clear({ retries: 0 })).failedSlots, []);
+      // Mid-migration the source answers ASK for a key it no longer has.
+      const onSource = await masters[src].exists(fan.keys[slot]).catch((err) => (/^ASK /.test(err.message) ? 0 : 1));
+      assert.strictEqual(onSource, 0);
+      assert.strictEqual(await masters[dst].call('ASKING').then(() => masters[dst].exists(fan.keys[slot])), 0);
+    } finally {
+      if (moveKeys) {
+        await Promise.all(masters.map((n) => n.cluster('SETSLOT', slot, 'NODE', ids[dst])));
+        await (await startSlotMove(slot, dst, src))();
+      } else {
+        await Promise.all([src, dst].map((i) => masters[i].cluster('SETSLOT', slot, 'STABLE')));
+      }
+      await new Promise((resolve) => cluster.refreshSlotsCache(resolve));
+    }
+  });
+}
+
+test('publish does not wait out a stalled node more than once', async () => {
+  const stalled = cluster.nodes('master')[0];
+  const timing = new Redis.Cluster(NODES, { redisOptions: { commandTimeout: 300 } });
+  try {
+    await new Promise((resolve, reject) => {
+      timing.once('ready', resolve);
+      timing.once('error', reject);
+    });
+    const fan = new IntraSlot(timing, { name: 'setCB' });
+    await stalled.call('CLIENT', 'PAUSE', '5000', 'WRITE');
+    const t0 = Date.now();
+    await assert.rejects(
+      () => fan.publish(['a']),
+      (err) => err instanceof PartialPublishError && /timed out/i.test(err.message)
+    );
+    // Three retries would add a second of waiting plus three more timeouts.
+    assert.ok(Date.now() - t0 < 1500, `publish took ${Date.now() - t0} ms`);
+  } finally {
+    await stalled.call('CLIENT', 'UNPAUSE');
+    timing.disconnect();
   }
 });
 
