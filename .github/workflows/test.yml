@@ -11,15 +11,17 @@ permissions:
 
 jobs:
   test:
-    name: test (node ${{ matrix.node }}, ${{ matrix.server }})
+    name: test (node ${{ matrix.node }}, ${{ matrix.server }}, ioredis ${{ matrix.ioredis || 5 }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         include:
           # Ubuntu's redis-server, 7.0, on the oldest and newest supported Node.
-          - { node: 18, server: redis-7.0 }
+          - { node: 22, server: redis-7.0 }
           - { node: 24, server: redis-7.0 }
+          # The lockfile pins ioredis 5; the peer range also allows 6.
+          - { node: 24, server: redis-7.0, ioredis: 6 }
           # Newer servers, from their official images.
           - node: 24
             server: redis-8.10
@@ -41,6 +43,11 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Install ioredis ${{ matrix.ioredis }}
+        if: ${{ matrix.ioredis }}
+        env:
+          IOREDIS: ${{ matrix.ioredis }}
+        run: pnpm add -D "ioredis@$IOREDIS"
       - name: Check the package ships its type declarations
         run: npm pack --dry-run 2>&1 | grep -q 'types/index.d.ts'
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
