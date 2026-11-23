@@ -88,8 +88,8 @@ intersect at all, and it loses coverage on 96.7% of simulated reshards.
 npm install intraslot ioredis
 ```
 
-`ioredis` is a peer dependency. Node 18+, and Redis 7+ or Valkey 8+: CI runs the
-live-cluster tests against Redis 7.0 and 8.10 and Valkey 8.1 and 9.1.
+`ioredis` 5 or 6 is a peer dependency. Node 22+, and Redis 7+ or Valkey 8+: CI
+runs the live-cluster tests against Redis 7.0 and 8.10 and Valkey 8.1 and 9.1.
 
 ## Usage
 
@@ -287,6 +287,12 @@ string IDs costs **~141 MB cluster-wide**, ~8.6 KB per replica. Budget roughly
 
 Comfortable for flags, cohorts, blocklists and presence sets. Wrong tool for
 anything large — at 256 KB per copy you are looking at 4 GB.
+
+Writes through the script free a replaced replica in the background (UNLINK).
+For a user that can't run scripts, a replace goes through RENAME, and emptying
+the set through DEL, which free the old set inside the command unless the server
+sets `lazyfree-lazy-server-del yes` and `lazyfree-lazy-user-del yes`. Turn them
+on if the set is large.
 
 ## Correctness
 
