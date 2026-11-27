@@ -48,7 +48,7 @@
   },
   "devDependencies": {
     "cluster-key-slot": "^1.1.2",
-    "ioredis": "^5.4.1",
+    "ioredis": "^6.0.0",
     "typescript": "7.0.2"
   }
 }
