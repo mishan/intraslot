@@ -661,7 +661,7 @@ for (const [label, retries] of [['retries a slot caught mid-migration', 3], ['re
       } else {
         await assert.rejects(
           () => fan.publish(['b'], { retries }),
-          (err) => err instanceof PartialPublishError && /slot 100: (ASK|TRYAGAIN)/.test(err.message)
+          (err) => err instanceof PartialPublishError && /slot 100: (.*Last error: \w*Error: )?(ASK|TRYAGAIN|MOVED) /.test(err.message)
         );
         assert.ok(!handedOver, 'publish retried');
       }

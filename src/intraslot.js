@@ -744,7 +744,10 @@ class IntraSlot {
    */
   async _retryMigrations(result, retries, total) {
     let { failedSlots, errors } = result;
-    const migrating = () => failedSlots.every((slot) => /^(TRYAGAIN|ASK|MOVED) /.test(errors[slot] || ''));
+    // ioredis 6.1+ follows pipeline redirections itself and, when it gives up,
+    // wraps the last one in "Too many Cluster redirections".
+    const migrating = () => failedSlots.every((slot) =>
+      /^(Too many Cluster redirections\. Last error: \w*Error: )?(TRYAGAIN|ASK|MOVED) /.test(errors[slot] || ''));
     for (let attempt = 0; attempt < retries && failedSlots.length && migrating(); attempt++) {
       await new Promise((resolve) => setTimeout(resolve, [100, 300, 600][attempt] ?? 600));
       ({ errors } = await this.catchUp(failedSlots));

@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   test:
-    name: test (node ${{ matrix.node }}, ${{ matrix.server }}, ioredis ${{ matrix.ioredis || 5 }})
+    name: test (node ${{ matrix.node }}, ${{ matrix.server }}, ioredis ${{ matrix.ioredis || 6 }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -20,8 +20,8 @@ jobs:
           # Ubuntu's redis-server, 7.0, on the oldest and newest supported Node.
           - { node: 22, server: redis-7.0 }
           - { node: 24, server: redis-7.0 }
-          # The lockfile pins ioredis 5; the peer range also allows 6.
-          - { node: 24, server: redis-7.0, ioredis: 6 }
+          # The lockfile pins ioredis 6; the peer range also allows 5.
+          - { node: 24, server: redis-7.0, ioredis: 5 }
           # Newer servers, from their official images.
           - node: 24
             server: redis-8.10
