@@ -127,6 +127,9 @@ class Coalescer extends EventEmitter {
     const wait = Math.max(0, this._lastStart + this.tickMs - performance.now());
     this._timer = setTimeout(() => {
       this._timer = null;
+      // Timers run off the event loop's cached millisecond clock, so one can
+      // fire a little before performance.now() says the tick is over.
+      if (performance.now() < this._lastStart + this.tickMs) return this._schedule();
       this._maybeFlush();
     }, wait);
     if (this._timer.unref) this._timer.unref();

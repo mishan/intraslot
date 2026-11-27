@@ -10,8 +10,8 @@ const { performance } = require('node:perf_hooks');
 const { Coalescer } = require('../src/coalescer');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-// Timers can fire up to a millisecond early relative to performance.now().
-const SLACK = 2;
+// The fake stamps a start a few microseconds after the coalescer does.
+const SLACK = 0.1;
 
 /** A fanout that records when each flush starts and ends. */
 function fakeFanout({ ms = 5, failures = 0 } = {}) {
