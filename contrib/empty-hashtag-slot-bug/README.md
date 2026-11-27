@@ -7,11 +7,11 @@ their shared `cluster-key-slot` dependency.
 **Status:** fixed in both clients. node-redis
 [#3431](https://github.com/redis/node-redis/pull/3431) (merged 2026-08-31)
 shipped in `@redis/client` 6.3.0. ioredis
-[#2172](https://github.com/redis/ioredis/pull/2172) (merged 2026-09-01) is in
-6.1.0-beta.1 but not yet in a stable release. Each vendors the slot function with the patch below and drops the
+[#2172](https://github.com/redis/ioredis/pull/2172) (merged 2026-09-01)
+shipped in 6.1.0 (2026-11-23). Each vendors the slot function with the patch below and drops the
 `cluster-key-slot` dependency, since it could not be fixed upstream — see [Why
 this had to land in the clients](#why-this-had-to-land-in-the-clients). Releases
-up to the versions above still carry the bug.
+before those versions carry the bug.
 
 Written up here because [intraslot](https://github.com/mishan/intraslot) had to
 implement slot math itself to work around it. Everything below was measured

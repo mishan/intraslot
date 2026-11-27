@@ -345,8 +345,8 @@ both now vendor the slot function with the patch applied
 (ioredis [#2172](https://github.com/redis/ioredis/pull/2172), node-redis
 [#3431](https://github.com/redis/node-redis/pull/3431)). The node-redis fix
 shipped in `@redis/client` 6.3.0; the 5.x maintenance line still has the bug.
-The ioredis fix is in 6.1.0-beta.1, and the latest stable release, 6.0.0, still
-has the bug as of this writing. A full write-up, per-client call sites,
+The ioredis fix shipped in 6.1.0 on Nov 23, 2026; 5.x and 6.0.0 still have the
+bug. A full write-up, per-client call sites,
 the patch and reproducible validation are in
 [`contrib/empty-hashtag-slot-bug/`](contrib/empty-hashtag-slot-bug/).
 
